@@ -1,14 +1,18 @@
 # add-pr-comment
 
 <!-- ALL-CONTRIBUTORS-BADGE:START - Do not remove or modify this section -->
-
-[![All Contributors](https://img.shields.io/badge/all_contributors-6-orange.svg?style=flat-square)](#contributors-)
-
+[![All Contributors](https://img.shields.io/badge/all_contributors-9-orange.svg?style=flat-square)](#contributors-)
 <!-- ALL-CONTRIBUTORS-BADGE:END -->
 
-A GitHub Action which adds a comment to a pull request's issue.
+[![CI](https://github.com/mshick/add-pr-comment/actions/workflows/ci.yml/badge.svg)](https://github.com/mshick/add-pr-comment/actions/workflows/ci.yml)
+[![Check dist/](https://github.com/mshick/add-pr-comment/actions/workflows/check-dist.yml/badge.svg)](https://github.com/mshick/add-pr-comment/actions/workflows/check-dist.yml)
+[![CodeQL](https://github.com/mshick/add-pr-comment/actions/workflows/codeql.yml/badge.svg)](https://github.com/mshick/add-pr-comment/actions/workflows/codeql.yml)
+[![Coverage](./badges/coverage.svg)](./badges/coverage.svg)
+[![OpenSSF Baseline](https://www.bestpractices.dev/projects/12345/baseline)](https://www.bestpractices.dev/projects/12345)
 
-This actions also works on [issue](https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#issues),
+A GitHub Action which adds a comment to a pull request issue or commit.
+
+This action also works on [issue](https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#issues),
 [issue_comment](https://docs.github.com/en/developers/webhooks-and-events/webhooks/webhook-events-and-payloads#issue_comment),
 [deployment_status](https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#deployment_status),
 [push](https://docs.github.com/en/actions/using-workflows/events-that-trigger-workflows#push)
@@ -23,6 +27,10 @@ and any other event where an issue can be found directly on the payload or via a
 - Multiple posts to the same conversation optionally allowable.
 - Supports a proxy for fork-based PRs. [See below](#proxy-for-fork-based-prs).
 - Supports creating a message from a file path.
+- Supports [file attachments](#file-attachments) via GitHub Artifacts.
+- Automatic [message truncation](#message-truncation) for oversized messages (e.g., large Terraform plans).
+- Supports [commit comments](#commit-comments) in addition to PR/issue comments.
+- Available as a [library](#programmatic-usage) for use in custom actions and scripts.
 
 ## Usage
 
@@ -38,7 +46,7 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - uses: mshick/add-pr-comment@v2
+      - uses: mshick/add-pr-comment@v3
         with:
           message: |
             **Hello**
@@ -60,7 +68,7 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - uses: mshick/add-pr-comment@v2
+      - uses: mshick/add-pr-comment@v3
         with:
           message: |
             **Hello MAIN**
@@ -81,6 +89,7 @@ jobs:
 | repo-name                | with     | Name of the repo.                                                                                                                                                           | no       | {{ github.event.repository.name }} |
 | repo-token               | with     | Valid GitHub token, either the temporary token GitHub provides or a personal access token.                                                                                  | no       | {{ github.token }}                 |
 | message-id               | with     | Message id to use when searching existing comments. If found, updates the existing (sticky comment).                                                                        | no       |                                    |
+| delete-on-status         | with     | If specified and a comment exists and the status is matching the value of this option, the comment will be deleted                                                          | no       |                                    |
 | refresh-message-position | with     | Should the sticky message be the last one in the PR's feed.                                                                                                                 | no       | false                              |
 | allow-repeats            | with     | Boolean flag to allow identical messages to be posted each time this action is run.                                                                                         | no       | false                              |
 | proxy-url                | with     | String for your proxy service URL if you'd like this to work with fork-based PRs.                                                                                           | no       |                                    |
@@ -90,6 +99,40 @@ jobs:
 | preformatted             | with     | Treat message text as pre-formatted and place it in a codeblock                                                                                                             | no       |                                    |
 | find                     | with     | Patterns to find in an existing message and replace with either `replace` text or a resolved `message`. See [Find-and-Replace](#find-and-replace) for more detail.          | no       |                                    |
 | replace                  | with     | Strings to replace a found pattern with. Each new line is a new replacement, or if you only have one pattern, you can replace with a multiline string.                      | no       |                                    |
+| attach-path              | with     | A file path or glob pattern for files to upload as artifacts and link in the comment. See [File Attachments](#file-attachments).                                            | no       |                                    |
+| attach-name              | with     | Name for the uploaded artifact.                                                                                                                                             | no       | pr-comment-attachments             |
+| attach-text              | with     | Markdown content for the attachment section. Always separated from the comment by a horizontal rule. Supports `%ARTIFACT_URL%` and `%ATTACH_NAME%` template variables.      | no       | (see [File Attachments](#file-attachments)) |
+| truncate                 | with     | Truncation mode when the message exceeds the safe comment length. See [Message Truncation](#message-truncation).                                                            | no       | artifact                           |
+| comment-target           | with     | Where to post the comment. Use `pr` for pull request/issue comments or `commit` for commit comments. See [Commit Comments](#commit-comments).                              | no       | pr                                 |
+| commit-sha               | with     | The commit SHA to comment on when `comment-target` is `commit`. Defaults to the current commit.                                                                             | no       | {{ github.sha }}                   |
+
+## Outputs
+
+| Output            | Description                                                       |
+| ----------------- | ----------------------------------------------------------------- |
+| `comment-created` | `"true"` if a new comment was created, `"false"` otherwise.       |
+| `comment-updated` | `"true"` if an existing comment was updated, `"false"` otherwise. |
+| `comment-id`      | The numeric ID of the created or updated comment.                 |
+| `artifact-url`    | If files were attached, the URL to download the artifact.         |
+| `truncated`       | `"true"` if the message was truncated, `"false"` otherwise.      |
+| `truncated-artifact-url` | If truncated in artifact mode, the URL to download the full message. |
+
+### Using outputs in subsequent steps
+
+```yaml
+- uses: mshick/add-pr-comment@v3
+  id: comment
+  with:
+    message: 'Hello world'
+
+- name: Check outputs
+  run: |
+    echo "Comment created: ${{ steps.comment.outputs.comment-created }}"
+    echo "Comment updated: ${{ steps.comment.outputs.comment-updated }}"
+    echo "Comment ID: ${{ steps.comment.outputs.comment-id }}"
+```
+
+> **Tip:** By default, comments are "upsert" — a comment is created on the first run and updated on subsequent runs when matched by `message-id`. If you want this create-or-update behavior, you do not need to set `update-only`. Setting `update-only: true` skips comment creation entirely and only updates an existing comment. Use it when you specifically want no comment to appear unless one was already posted by a previous step or run.
 
 ## Advanced Uses
 
@@ -113,7 +156,7 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - uses: mshick/add-pr-comment@v2
+      - uses: mshick/add-pr-comment@v3
         with:
           message: |
             **Howdie!**
@@ -138,7 +181,7 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - uses: mshick/add-pr-comment@v2
+      - uses: mshick/add-pr-comment@v3
         if: always()
         with:
           message: |
@@ -165,7 +208,7 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - uses: mshick/add-pr-comment@v2
+      - uses: mshick/add-pr-comment@v3
         if: always()
         with:
           message-path: |
@@ -201,7 +244,7 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - uses: mshick/add-pr-comment@v2
+      - uses: mshick/add-pr-comment@v3
         if: always()
         with:
           find: |
@@ -239,7 +282,7 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - uses: mshick/add-pr-comment@v2
+      - uses: mshick/add-pr-comment@v3
         if: always()
         with:
           find: |
@@ -283,7 +326,7 @@ jobs:
     permissions:
       pull-requests: write
     steps:
-      - uses: mshick/add-pr-comment@v2
+      - uses: mshick/add-pr-comment@v3
         if: always()
         with:
           message-path: |
@@ -301,6 +344,171 @@ secret message from message.txt
 
 world
 ```
+
+### File Attachments
+
+You can attach files to your PR comments by uploading them as GitHub Artifacts and embedding download links in the comment body. Files matching the `attach-path` glob are uploaded as a single artifact, and a markdown section with the download link is appended to your comment, separated by a horizontal rule.
+
+> **Note:** Artifact download URLs require GitHub authentication and expire based on your repository's retention settings (default 90 days). Images will not render inline — they appear as download links. This is a GitHub platform limitation.
+
+**Simple — attach a file with defaults**
+
+```yaml
+on:
+  pull_request:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "Build output here" > report.txt
+      - uses: mshick/add-pr-comment@v3
+        with:
+          message: |
+            Build complete! See attached report.
+          attach-path: report.txt
+```
+
+**Advanced — glob pattern, custom name, and custom text template**
+
+```yaml
+on:
+  pull_request:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p coverage
+          echo "line coverage: 85%" > coverage/summary.txt
+          echo "<html>...</html>" > coverage/report.html
+      - uses: mshick/add-pr-comment@v3
+        with:
+          message: |
+            ## Coverage Report
+            Tests passed with 85% line coverage.
+          attach-path: coverage/*
+          attach-name: coverage-report
+          attach-text: '📎 [Download %ATTACH_NAME%](%ARTIFACT_URL%)'
+```
+
+The `attach-text` input supports two template variables:
+
+| Variable         | Replaced with                      |
+| ---------------- | ---------------------------------- |
+| `%ARTIFACT_URL%` | The artifact download URL          |
+| `%ATTACH_NAME%`  | The value of the `attach-name` input |
+
+### Message Truncation
+
+GitHub's API limits comment bodies to 65,536 characters. Messages that exceed this limit (common with large Terraform plans, verbose test output, etc.) would previously cause the action to fail with an "Argument list too long" or API error.
+
+This action automatically truncates oversized messages to stay within a safe limit (61,440 characters, which includes a 4,096 character buffer). The `truncate` input controls what happens with the full message:
+
+| Mode | Behavior |
+| ---- | -------- |
+| `artifact` (default) | The full, untruncated message is uploaded as a downloadable GitHub Artifact. The comment is truncated and a download link is appended. |
+| `simple` | The comment is truncated and a notice is appended. No artifact is uploaded. |
+
+If artifact upload fails (e.g., permissions, network issues), the action automatically falls back to simple truncation.
+
+**Example — default artifact mode**
+
+```yaml
+on:
+  pull_request:
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: terraform plan -no-color > plan.txt
+      - uses: mshick/add-pr-comment@v3
+        with:
+          message-path: plan.txt
+```
+
+If the plan output exceeds the safe limit, the comment will be truncated and end with:
+
+> **This message was truncated.** [Download full message](https://github.com/...)
+
+**Example — simple mode (no artifact)**
+
+```yaml
+- uses: mshick/add-pr-comment@v3
+  with:
+    message-path: plan.txt
+    truncate: simple
+```
+
+The comment will be truncated and end with:
+
+> **This message was truncated.**
+
+**Using the truncation outputs**
+
+```yaml
+- uses: mshick/add-pr-comment@v3
+  id: comment
+  with:
+    message-path: plan.txt
+
+- name: Check if truncated
+  if: steps.comment.outputs.truncated == 'true'
+  run: |
+    echo "Message was truncated"
+    echo "Full message: ${{ steps.comment.outputs.truncated-artifact-url }}"
+```
+
+> **Tip:** For very large outputs like Terraform plans, prefer using `message-path` over the `message` input. The `message` input is passed via environment variables, which have OS-level size limits that can cause failures before the action even runs. File-based input via `message-path` avoids this entirely.
+
+### Commit Comments
+
+Instead of posting to a pull request or issue, you can post comments directly on a commit. This is useful for workflows triggered by `push` events or when you want feedback attached to a specific commit rather than a PR conversation.
+
+**Example**
+
+```yaml
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: mshick/add-pr-comment@v3
+        with:
+          comment-target: commit
+          message: |
+            Build succeeded for ${{ github.sha }}
+```
+
+You can also specify a different commit SHA:
+
+```yaml
+- uses: mshick/add-pr-comment@v3
+  with:
+    comment-target: commit
+    commit-sha: ${{ github.event.before }}
+    message: |
+      Comparing changes since this commit.
+```
+
+> **Note:** Commit comments use a different GitHub API than issue/PR comments. Sticky comments (`message-id`), `update-only`, `refresh-message-position`, and `delete-on-status` all work with commit comments. The `proxy-url` option is not supported for commit comments.
+
+> **Important:** The `commit` comment target requires that commit comments are enabled on your repository. GitHub now allows repository admins to [disable comments on individual commits](https://github.blog/changelog/2026-03-25-disable-comments-on-individual-commits/). If commit comments are disabled, this action will fail when using `comment-target: commit`.
 
 ### Bring your own issues
 
@@ -329,12 +537,75 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: mshick/add-pr-comment@v2
+      - uses: mshick/add-pr-comment@v3
         with:
           issue: ${{ steps.pr.outputs.issue }}
           message: |
             **Howdie!**
 ```
+
+### Delete on status
+
+This option can be used if comment needs to be removed if a status is reached.
+
+**Example**
+
+> Here, a comment will be added on failure, but on a subsequent run,
+> if the job reaches success status, the comment will be deleted.
+
+```yaml
+on:
+  pull_request:
+
+jobs:
+  pr:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: mshick/add-pr-comment@v3
+        if: always()
+        with:
+          message-failure: There was a failure
+          delete-on-status: success
+```
+
+## Programmatic Usage
+
+This package also exports its core functions as a library, so you can use them in your own custom GitHub Actions or scripts.
+
+```bash
+npm add @mshick/add-pr-comment
+```
+
+```typescript
+import {
+  createComment,
+  getExistingComment,
+  updateComment,
+  deleteComment,
+  createCommitComment,
+  getMessage,
+  truncateMessage,
+  uploadAttachments,
+} from '@mshick/add-pr-comment'
+```
+
+The library exports functions for managing both issue/PR comments and commit comments, file discovery, message resolution, truncation, attachments, and proxy support. Type definitions are included.
+
+## Security
+
+### Version Pinning
+
+There are three ways to reference this action, from most to least secure:
+
+1. **Commit SHA (most secure)**: `uses: mshick/add-pr-comment@ffd016c7e151d97d69d21a843022fd4cd5b96fe5` — immutable, can never change.
+2. **Semver tag (recommended)**: `uses: mshick/add-pr-comment@v3.9.0` — protected by tag rulesets, cannot be moved or deleted once created.
+3. **Major version tag (convenient but less secure)**: `uses: mshick/add-pr-comment@v3` — floating tag that is updated on each release to point to the latest version. While convenient, floating tags are a potential security risk as they could theoretically be re-pointed to a different commit.
+
+For maximum security, pin to a full semver tag or commit SHA. Semver tags (e.g., `v3.9.0`) in this repository are protected by GitHub tag rulesets and cannot be modified after creation.
+
+Releases include build provenance attestations generated by [`actions/attest-build-provenance`](https://github.com/actions/attest-build-provenance), which can be used to verify that the release was produced by the official CI pipeline.
 
 ## Contributors ✨
 
@@ -352,6 +623,11 @@ Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/d
       <td align="center" valign="top" width="14.28%"><a href="https://ahanoff.dev"><img src="https://avatars.githubusercontent.com/u/2371703?v=4?s=100" width="100px;" alt="Akhan Zhakiyanov"/><br /><sub><b>Akhan Zhakiyanov</b></sub></a><br /><a href="https://github.com/mshick/add-pr-comment/commits?author=ahanoff" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/ahatzz11"><img src="https://avatars.githubusercontent.com/u/6256032?v=4?s=100" width="100px;" alt="Alex Hatzenbuhler"/><br /><sub><b>Alex Hatzenbuhler</b></sub></a><br /><a href="https://github.com/mshick/add-pr-comment/commits?author=ahatzz11" title="Code">💻</a></td>
       <td align="center" valign="top" width="14.28%"><a href="http://www.august8.net"><img src="https://avatars.githubusercontent.com/u/766820?v=4?s=100" width="100px;" alt="Tommy Wang"/><br /><sub><b>Tommy Wang</b></sub></a><br /><a href="https://github.com/mshick/add-pr-comment/commits?author=twang817" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/ljetten"><img src="https://avatars.githubusercontent.com/u/7528045?v=4?s=100" width="100px;" alt="Laura Jetten"/><br /><sub><b>Laura Jetten</b></sub></a><br /><a href="https://github.com/mshick/add-pr-comment/commits?author=ljetten" title="Code">💻</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/manan-jadhav-ab"><img src="https://avatars.githubusercontent.com/u/166636237?v=4?s=100" width="100px;" alt="Manan Jadhav"/><br /><sub><b>Manan Jadhav</b></sub></a><br /><a href="https://github.com/mshick/add-pr-comment/commits?author=manan-jadhav-ab" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/anne-pc"><img src="https://avatars.githubusercontent.com/u/27091643?v=4?s=100" width="100px;" alt="Jiří Majer"/><br /><sub><b>Jiří Majer</b></sub></a><br /><a href="https://github.com/mshick/add-pr-comment/commits?author=anne-pc" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>

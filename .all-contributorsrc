@@ -59,6 +59,33 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "ljetten",
+      "name": "Laura Jetten",
+      "avatar_url": "https://avatars.githubusercontent.com/u/7528045?v=4",
+      "profile": "https://github.com/ljetten",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "manan-jadhav-ab",
+      "name": "Manan Jadhav",
+      "avatar_url": "https://avatars.githubusercontent.com/u/166636237?v=4",
+      "profile": "https://github.com/manan-jadhav-ab",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "anne-pc",
+      "name": "Jiří Majer",
+      "avatar_url": "https://avatars.githubusercontent.com/u/27091643?v=4",
+      "profile": "https://github.com/anne-pc",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "contributorsPerLine": 7,
@@ -66,5 +93,6 @@
   "repoType": "github",
   "repoHost": "https://github.com",
   "projectName": "add-pr-comment",
-  "projectOwner": "mshick"
+  "projectOwner": "mshick",
+  "commitType": "docs"
 }
