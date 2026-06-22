@@ -47319,14 +47319,14 @@ const DANGEROUS_PROPERTY_NAMES = [
 
 const criticalProperties = ["__proto__", "constructor", "prototype"];
 
-const defaultOptions$2 = {
+const defaultOptions$3 = {
   allowBooleanAttributes: false, //A tag can have attributes without any value
   unpairedTags: []
 };
 
 //const tagsPattern = new RegExp("<\\/?([\\w:\\-_\.]+)\\s*\/?>","g");
 function validate(xmlData, options) {
-  options = Object.assign({}, defaultOptions$2, options);
+  options = Object.assign({}, defaultOptions$3, options);
 
   //xmlData = xmlData.replace(/(\r\n|\n|\r)/gm,"");//make it single line
   //xmlData = xmlData.replace(/(^\s*<\?xml.*?\?>)/g,"");//Remove XML starting tag
@@ -47736,6 +47736,612 @@ function getPositionFromMatch(match) {
   return match.startIndex + match[1].length;
 }
 
+// ---------------------------------------------------------------------------
+// Complete HTML5 named entity reference
+// Organized by logical categories for easy maintenance and selective importing
+// ---------------------------------------------------------------------------
+
+
+/**
+ * Currency Symbols
+ * @type {Record<string, string>}
+ */
+const CURRENCY = {
+  cent: '¢',
+  pound: '£',
+  curren: '¤',
+  yen: '¥',
+  euro: '€',
+  dollar: '$',
+  euro: '€',
+  fnof: 'ƒ',
+  inr: '₹',
+  af: '؋',
+  birr: 'ብር',
+  peso: '₱',
+  rub: '₽',
+  won: '₩',
+  yuan: '¥',
+  cedil: '¸',
+};
+
+const XML = {
+  amp: "&",
+  apos: "'",
+  gt: ">",
+  lt: "<",
+  quot: "\""
+};
+const COMMON_HTML = {
+  nbsp: '\u00a0',
+  copy: '\u00a9',
+  reg: '\u00ae',
+  trade: '\u2122',
+  mdash: '\u2014',
+  ndash: '\u2013',
+  hellip: '\u2026',
+  laquo: '\u00ab',
+  raquo: '\u00bb',
+  lsquo: '\u2018',
+  rsquo: '\u2019',
+  ldquo: '\u201c',
+  rdquo: '\u201d',
+  bull: '\u2022',
+  para: '\u00b6',
+  sect: '\u00a7',
+  deg: '\u00b0',
+  frac12: '\u00bd',
+  frac14: '\u00bc',
+  frac34: '\u00be',
+};
+// ---------------------------------------------------------------------------
+// Note: NUMERIC_ENTITIES (&#NNN; / &#xHH;) are handled by the scanner directly
+// via String.fromCodePoint() without any map lookup.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Built-in named entity map  (name → replacement string)
+// No regex, no {regex,val} objects — just flat key/value pairs.
+// ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const SPECIAL_CHARS = new Set('!?\\\\/[]$%{}^&*()<>|+');
+
+/**
+ * Validate that an entity name contains no dangerous characters.
+ * @param {string} name
+ * @returns {string} the name, unchanged
+ * @throws {Error} on invalid characters
+ */
+function validateEntityName$1(name) {
+  if (name[0] === '#') {
+    throw new Error(`[EntityReplacer] Invalid character '#' in entity name: "${name}"`);
+  }
+  for (const ch of name) {
+    if (SPECIAL_CHARS.has(ch)) {
+      throw new Error(`[EntityReplacer] Invalid character '${ch}' in entity name: "${name}"`);
+    }
+  }
+  return name;
+}
+
+/**
+ * Merge one or more entity maps into a flat name→string map.
+ * Accepts either:
+ *   - plain string values:             { amp: '&' }
+ *   - legacy {regex,val} / {regx,val}: { lt: { regex: /.../, val: '<' } }
+ *
+ * Values containing '&' are skipped (recursive expansion risk).
+ *
+ * @param {...object} maps
+ * @returns {Record<string, string>}
+ */
+function mergeEntityMaps(...maps) {
+  const out = Object.create(null);
+  for (const map of maps) {
+    if (!map) continue;
+    for (const key of Object.keys(map)) {
+      const raw = map[key];
+      if (typeof raw === 'string') {
+        out[key] = raw;
+      } else if (raw && typeof raw === 'object' && raw.val !== undefined) {
+        // Legacy {regex,val} or {regx,val} — extract the string val only
+        const val = raw.val;
+        if (typeof val === 'string') {
+          out[key] = val;
+        }
+        // function vals are not supported in the scanner — skip
+      }
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// applyLimitsTo helpers
+// ---------------------------------------------------------------------------
+
+const LIMIT_TIER_EXTERNAL = 'external'; // input/runtime + persistent external maps
+const LIMIT_TIER_BASE = 'base';     // DEFAULT_XML_ENTITIES + namedEntities (system) maps
+const LIMIT_TIER_ALL = 'all';      // every entity regardless of tier
+
+/**
+ * Resolve `applyLimitsTo` option into a normalised Set of tier strings.
+ * Accepted values: 'external' | 'base' | 'all' | string[]
+ * Default: 'external' (only untrusted injected entities are counted).
+ * @param {string|string[]|undefined} raw
+ * @returns {Set<string>}
+ */
+function parseLimitTiers(raw) {
+  if (!raw || raw === LIMIT_TIER_EXTERNAL) return new Set([LIMIT_TIER_EXTERNAL]);
+  if (raw === LIMIT_TIER_ALL) return new Set([LIMIT_TIER_ALL]);
+  if (raw === LIMIT_TIER_BASE) return new Set([LIMIT_TIER_BASE]);
+  if (Array.isArray(raw)) return new Set(raw);
+  return new Set([LIMIT_TIER_EXTERNAL]); // safe default for unrecognised values
+}
+
+// ---------------------------------------------------------------------------
+// NCR (Numeric Character Reference) classification
+// ---------------------------------------------------------------------------
+
+// Severity order — higher number = stricter action.
+// Used to enforce minimum action levels for specific codepoint ranges.
+const NCR_LEVEL = Object.freeze({ allow: 0, leave: 1, remove: 2, throw: 3 });
+
+// XML 1.0 §2.2: allowed chars are #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+// Restricted C0: U+0001–U+001F excluding U+0009, U+000A, U+000D
+const XML10_ALLOWED_C0 = new Set([0x09, 0x0A, 0x0D]);
+
+/**
+ * Parse the `ncr` constructor option into flat, hot-path-friendly fields.
+ * @param {object|undefined} ncr
+ * @returns {{ xmlVersion: number, onLevel: number, nullLevel: number }}
+ */
+function parseNCRConfig(ncr) {
+  if (!ncr) {
+    return { xmlVersion: 1.0, onLevel: NCR_LEVEL.allow, nullLevel: NCR_LEVEL.remove };
+  }
+  const xmlVersion = ncr.xmlVersion === 1.1 ? 1.1 : 1.0;
+  const onLevel = NCR_LEVEL[ncr.onNCR] ?? NCR_LEVEL.allow;
+  const nullLevel = NCR_LEVEL[ncr.nullNCR] ?? NCR_LEVEL.remove;
+  // 'allow' is not meaningful for null — clamp to at least 'remove'
+  const clampedNull = Math.max(nullLevel, NCR_LEVEL.remove);
+  return { xmlVersion, onLevel, nullLevel: clampedNull };
+}
+
+// ---------------------------------------------------------------------------
+// EntityReplacer
+// ---------------------------------------------------------------------------
+
+/**
+ * Single-pass, zero-regex entity replacer for XML/HTML content.
+ *
+ * Algorithm: scan the string once for '&', read to ';', resolve via map
+ * or direct codepoint conversion, build output chunks, join once at the end.
+ *
+ * Entity lookup priority (highest → lowest):
+ *   1. input / runtime  (DOCTYPE entities for current document)
+ *   2. persistent external (survive across documents)
+ *   3. base named map   (DEFAULT_XML_ENTITIES + user-supplied namedEntities)
+ *
+ * Both input and external resolve as the 'external' tier for limit purposes.
+ * Base map entities resolve as the 'base' tier.
+ *
+ * Numeric / hex references (&#NNN; / &#xHH;) are resolved directly via
+ * String.fromCodePoint() — no map needed. They count as 'base' tier.
+ *
+ * @example
+ * const replacer = new EntityReplacer({ namedEntities: COMMON_HTML });
+ * replacer.setExternalEntities({ brand: 'Acme' });
+ *
+ * const instance = replacer.reset();
+ * instance.addInputEntities({ version: '1.0' });
+ * instance.encode('&brand; v&version; &lt;'); // 'Acme v1.0 <'
+ */
+class EntityDecoder {
+  /**
+   * @param {object} [options]
+   * @param {object|null}  [options.namedEntities]        — extra named entities merged into base map
+   * @param {object}  [options.limit]                 — security limits
+   * @param {number}       [options.limit.maxTotalExpansions=0]  — 0 = unlimited
+   * @param {number}       [options.limit.maxExpandedLength=0]   — 0 = unlimited
+   * @param {'external'|'base'|'all'|string[]} [options.limit.applyLimitsTo='external']
+   *   Which entity tiers count against the security limits:
+   *   - 'external' (default) — only input/runtime + persistent external entities
+   *   - 'base'               — only DEFAULT_XML_ENTITIES + namedEntities
+   *   - 'all'                — every entity regardless of tier
+   *   - string[]             — explicit combination, e.g. ['external', 'base']
+   * @param {((resolved: string, original: string) => string)|null} [options.postCheck=null]
+   * @param {string[]} [options.remove=[]] — entity names (e.g. ['nbsp', '#13']) to delete (replace with empty string)
+   * @param {string[]} [options.leave=[]]  — entity names to keep as literal (unchanged in output)
+   * @param {object}   [options.ncr]       — Numeric Character Reference controls
+   * @param {1.0|1.1}  [options.ncr.xmlVersion=1.0]
+   *   XML version governing which codepoint ranges are restricted:
+   *   - 1.0 — C0 controls U+0001–U+001F (except U+0009/000A/000D) are prohibited
+   *   - 1.1 — C0 controls are allowed when written as NCRs; C1 (U+007F–U+009F) decoded as-is
+   * @param {'allow'|'leave'|'remove'|'throw'} [options.ncr.onNCR='allow']
+   *   Base action for numeric references. Severity order: allow < leave < remove < throw.
+   *   For codepoint ranges that carry a minimum level (surrogates → remove, XML 1.0 C0 → remove),
+   *   the effective action is max(onNCR, rangeMinimum).
+   * @param {'remove'|'throw'} [options.ncr.nullNCR='remove']
+   *   Action for U+0000 (null). 'allow' and 'leave' are clamped to 'remove' since null is never safe.
+   */
+  constructor(options = {}) {
+    this._limit = options.limit || {};
+    this._maxTotalExpansions = this._limit.maxTotalExpansions || 0;
+    this._maxExpandedLength = this._limit.maxExpandedLength || 0;
+    this._postCheck = typeof options.postCheck === 'function' ? options.postCheck : r => r;
+    this._limitTiers = parseLimitTiers(this._limit.applyLimitsTo ?? LIMIT_TIER_EXTERNAL);
+    this._numericAllowed = options.numericAllowed ?? true;
+    // Base map: DEFAULT_XML_ENTITIES + user-supplied extras. Immutable after construction.
+    this._baseMap = mergeEntityMaps(XML, options.namedEntities || null);
+
+    // Persistent external entities — survive across documents.
+    // Stored as a separate map so reset() never touches them.
+    /** @type {Record<string, string>} */
+    this._externalMap = Object.create(null);
+
+    // Input / runtime entities — current document only, wiped on reset().
+    /** @type {Record<string, string>} */
+    this._inputMap = Object.create(null);
+
+    // Per-document counters
+    this._totalExpansions = 0;
+    this._expandedLength = 0;
+
+    // --- New: remove / leave sets ---
+    /** @type {Set<string>} */
+    this._removeSet = new Set(options.remove && Array.isArray(options.remove) ? options.remove : []);
+    /** @type {Set<string>} */
+    this._leaveSet = new Set(options.leave && Array.isArray(options.leave) ? options.leave : []);
+
+    // --- NCR config (parsed into flat fields for hot-path speed) ---
+    const ncrCfg = parseNCRConfig(options.ncr);
+    this._ncrXmlVersion = ncrCfg.xmlVersion;
+    this._ncrOnLevel = ncrCfg.onLevel;
+    this._ncrNullLevel = ncrCfg.nullLevel;
+  }
+
+  // -------------------------------------------------------------------------
+  // Persistent external entity registration
+  // -------------------------------------------------------------------------
+
+  /**
+   * Replace the full set of persistent external entities.
+   * All keys are validated — throws on invalid characters.
+   * @param {Record<string, string | { regex?: RegExp, val: string }>} map
+   */
+  setExternalEntities(map) {
+    if (map) {
+      for (const key of Object.keys(map)) {
+        validateEntityName$1(key);
+      }
+    }
+    this._externalMap = mergeEntityMaps(map);
+  }
+
+  /**
+   * Add a single persistent external entity.
+   * @param {string} key
+   * @param {string} value
+   */
+  addExternalEntity(key, value) {
+    validateEntityName$1(key);
+    if (typeof value === 'string' && value.indexOf('&') === -1) {
+      this._externalMap[key] = value;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Input / runtime entity registration (per document)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Inject DOCTYPE entities for the current document.
+   * Also resets per-document expansion counters.
+   * @param {Record<string, string | { regx?: RegExp, regex?: RegExp, val: string }>} map
+   */
+  addInputEntities(map) {
+    this._totalExpansions = 0;
+    this._expandedLength = 0;
+    this._inputMap = mergeEntityMaps(map);
+  }
+
+  // -------------------------------------------------------------------------
+  // Per-document reset
+  // -------------------------------------------------------------------------
+
+  /**
+   * Wipe input/runtime entities and reset counters.
+   * Call this before processing each new document.
+   * @returns {this}
+   */
+  reset() {
+    this._inputMap = Object.create(null);
+    this._totalExpansions = 0;
+    this._expandedLength = 0;
+    return this;
+  }
+
+  // -------------------------------------------------------------------------
+  // XML version (can be set after construction, e.g. once parser reads <?xml?>)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Update the XML version used for NCR classification.
+   * Call this as soon as the document's `<?xml version="...">` declaration is parsed.
+   * @param {1.0|1.1|number} version
+   */
+  setXmlVersion(version) {
+    this._ncrXmlVersion = version === 1.1 ? 1.1 : 1.0;
+  }
+
+  // -------------------------------------------------------------------------
+  // Primary API
+  // -------------------------------------------------------------------------
+
+  /**
+   * Replace all entity references in `str` in a single pass.
+   *
+   * @param {string} str
+   * @returns {string}
+   */
+  decode(str) {
+    if (typeof str !== 'string' || str.length === 0) return str;
+    //TODO: check if needed
+    //if (str.indexOf('&') === -1) return str; // fast path — no entities at all
+
+    const original = str;
+    const chunks = [];
+    const len = str.length;
+    let last = 0; // start of next unprocessed literal chunk
+    let i = 0;
+
+    const limitExpansions = this._maxTotalExpansions > 0;
+    const limitLength = this._maxExpandedLength > 0;
+    const checkLimits = limitExpansions || limitLength;
+
+    while (i < len) {
+      // Scan forward to next '&'
+      if (str.charCodeAt(i) !== 38 /* '&' */) { i++; continue; }
+
+      // --- Found '&' at position i ---
+
+      // Scan forward to ';'
+      let j = i + 1;
+      while (j < len && str.charCodeAt(j) !== 59 /* ';' */ && (j - i) <= 32) j++;
+
+      if (j >= len || str.charCodeAt(j) !== 59) {
+        // No closing ';' within window — treat '&' as literal
+        i++;
+        continue;
+      }
+
+      // Raw token between '&' and ';' (exclusive)
+      const token = str.slice(i + 1, j);
+      if (token.length === 0) { i++; continue; }
+
+      let replacement;
+      let tier; // which limit tier this entity belongs to
+
+      if (this._removeSet.has(token)) {
+        // Remove entity: replace with empty string
+        replacement = '';
+        // If entity was unknown (replacement undefined), we still need a tier for limits.
+        // Treat as external tier because it's user-directed removal of an unknown reference.
+        if (tier === undefined) {
+          tier = LIMIT_TIER_EXTERNAL;
+        }
+      } else if (this._leaveSet.has(token)) {
+        // Do not replace — keep original &token; as literal
+        i++;
+        continue;
+      } else if (token.charCodeAt(0) === 35 /* '#' */) {
+        // ---- Numeric / NCR reference ----
+        // NCR classification always runs first — prohibited codepoints must be
+        // caught regardless of numericAllowed.
+        const ncrResult = this._resolveNCR(token);
+        if (ncrResult === undefined) {
+          // 'leave' action — keep original &token; as-is
+          i++;
+          continue;
+        }
+        replacement = ncrResult; // '' for remove, char string for allow
+        tier = LIMIT_TIER_BASE;
+      } else {
+        // ---- Named reference ----
+        const resolved = this._resolveName(token);
+        replacement = resolved?.value;
+        tier = resolved?.tier;
+      }
+
+      if (replacement === undefined) {
+        // Unknown entity — leave as-is, advance past '&' only
+        i++;
+        continue;
+      }
+
+      // Flush literal chunk before this entity
+      if (i > last) chunks.push(str.slice(last, i));
+      chunks.push(replacement);
+      last = j + 1; // skip past ';'
+      i = last;
+
+      // Apply expansion limits only if this tier is being tracked
+      if (checkLimits && this._tierCounts(tier)) {
+        if (limitExpansions) {
+          this._totalExpansions++;
+          if (this._totalExpansions > this._maxTotalExpansions) {
+            throw new Error(
+              `[EntityReplacer] Entity expansion count limit exceeded: ` +
+              `${this._totalExpansions} > ${this._maxTotalExpansions}`
+            );
+          }
+        }
+        if (limitLength) {
+          // delta: replacement.length minus the raw &token; length (token.length + 2 for '&' and ';')
+          const delta = replacement.length - (token.length + 2);
+          if (delta > 0) {
+            this._expandedLength += delta;
+            if (this._expandedLength > this._maxExpandedLength) {
+              throw new Error(
+                `[EntityReplacer] Expanded content length limit exceeded: ` +
+                `${this._expandedLength} > ${this._maxExpandedLength}`
+              );
+            }
+          }
+        }
+      }
+    }
+
+    // Flush trailing literal
+    if (last < len) chunks.push(str.slice(last));
+
+    // If nothing was replaced, chunks is empty — return original
+    const result = chunks.length === 0 ? str : chunks.join('');
+
+    return this._postCheck(result, original);
+  }
+
+  // -------------------------------------------------------------------------
+  // Private: limit tier check
+  // -------------------------------------------------------------------------
+
+  /**
+   * Returns true if a resolved entity of the given tier should count
+   * against the expansion/length limits.
+   * @param {string} tier  — LIMIT_TIER_EXTERNAL | LIMIT_TIER_BASE
+   * @returns {boolean}
+   */
+  _tierCounts(tier) {
+    if (this._limitTiers.has(LIMIT_TIER_ALL)) return true;
+    return this._limitTiers.has(tier);
+  }
+
+  // -------------------------------------------------------------------------
+  // Private: entity resolution
+  // -------------------------------------------------------------------------
+
+  /**
+   * Resolve a named entity token (without & and ;).
+   * Priority: inputMap > externalMap > baseMap
+   * Returns the resolved value tagged with its limit tier.
+   *
+   * @param {string} name
+   * @returns {{ value: string, tier: string }|undefined}
+   */
+  _resolveName(name) {
+    // input and external both count as 'external' tier for limit purposes —
+    // they are injected at runtime and are the untrusted surface.
+    if (name in this._inputMap) return { value: this._inputMap[name], tier: LIMIT_TIER_EXTERNAL };
+    if (name in this._externalMap) return { value: this._externalMap[name], tier: LIMIT_TIER_EXTERNAL };
+    if (name in this._baseMap) return { value: this._baseMap[name], tier: LIMIT_TIER_BASE };
+    return undefined;
+  }
+
+  /**
+   * Classify a codepoint and return the minimum action level that must be applied.
+   * Returns -1 when no minimum is imposed (normal allow path).
+   *
+   * Ranges checked (in priority order):
+   *   1. U+0000            — null, governed by nullNCR (always ≥ remove)
+   *   2. U+D800–U+DFFF     — surrogates, always prohibited (min: remove)
+   *   3. U+0001–U+001F \ {0x09,0x0A,0x0D}  — XML 1.0 restricted C0 (min: remove)
+   *      (skipped in XML 1.1 — C0 controls are allowed when written as NCRs)
+   *
+   * @param {number} cp  — codepoint
+   * @returns {number}   — minimum NCR_LEVEL value, or -1 for no restriction
+   */
+  _classifyNCR(cp) {
+    // 1. Null
+    if (cp === 0) return this._ncrNullLevel;
+
+    // 2. Surrogates — always prohibited, minimum 'remove'
+    if (cp >= 0xD800 && cp <= 0xDFFF) return NCR_LEVEL.remove;
+
+    // 3. XML 1.0 restricted C0 controls
+    if (this._ncrXmlVersion === 1.0) {
+      if (cp >= 0x01 && cp <= 0x1F && !XML10_ALLOWED_C0.has(cp)) return NCR_LEVEL.remove;
+    }
+
+    return -1; // no restriction
+  }
+
+  /**
+   * Execute a resolved NCR action.
+   *
+   * @param {number} action   — NCR_LEVEL value
+   * @param {string} token    — raw token (e.g. '#38') for error messages
+   * @param {number} cp       — codepoint, used only for error messages
+   * @returns {string|undefined}
+   *   - decoded character string  → 'allow'
+   *   - ''                        → 'remove'
+   *   - undefined                 → 'leave' (caller must skip past '&' only)
+   *   - throws Error              → 'throw'
+   */
+  _applyNCRAction(action, token, cp) {
+    switch (action) {
+      case NCR_LEVEL.allow: return String.fromCodePoint(cp);
+      case NCR_LEVEL.remove: return '';
+      case NCR_LEVEL.leave: return undefined; // signal: keep literal
+      case NCR_LEVEL.throw:
+        throw new Error(
+          `[EntityDecoder] Prohibited numeric character reference ` +
+          `&${token}; (U+${cp.toString(16).toUpperCase().padStart(4, '0')})`
+        );
+      default: return String.fromCodePoint(cp);
+    }
+  }
+
+  /**
+   * Full NCR resolution pipeline for a numeric token.
+   *
+   * Steps:
+   *   1. Parse the codepoint (decimal or hex).
+   *   2. Validate the raw codepoint range (NaN, <0, >0x10FFFF).
+   *   3. If numericAllowed is false and no minimum restriction applies → leave as-is.
+   *   4. Classify the codepoint to find the minimum required action level.
+   *   5. Resolve effective action = max(onNCR, minimum).
+   *   6. Apply and return.
+   *
+   * @param {string} token  — e.g. '#38', '#x26', '#X26'
+   * @returns {string|undefined}
+   *   - string (incl. '')  — replacement ('' = remove)
+   *   - undefined          — leave original &token; as-is
+   */
+  _resolveNCR(token) {
+    // Step 1: parse codepoint
+    const second = token.charCodeAt(1);
+    let cp;
+    if (second === 120 /* x */ || second === 88 /* X */) {
+      cp = parseInt(token.slice(2), 16);
+    } else {
+      cp = parseInt(token.slice(1), 10);
+    }
+
+    // Step 2: out-of-range → leave as-is unconditionally
+    if (Number.isNaN(cp) || cp < 0 || cp > 0x10FFFF) return undefined;
+
+    // Step 3: classify to get minimum action level
+    const minimum = this._classifyNCR(cp);
+
+    // Step 4: if numericAllowed is false and no hard minimum → leave
+    if (!this._numericAllowed && minimum < NCR_LEVEL.remove) return undefined;
+
+    // Step 5: effective action = max(configured onNCR, range minimum)
+    const effective = minimum === -1
+      ? this._ncrOnLevel
+      : Math.max(this._ncrOnLevel, minimum);
+
+    // Step 6: apply
+    return this._applyNCRAction(effective, token, cp);
+  }
+}
+
 const defaultOnDangerousProperty = (name) => {
   if (DANGEROUS_PROPERTY_NAMES.includes(name)) {
     return "__" + name;
@@ -47744,7 +48350,7 @@ const defaultOnDangerousProperty = (name) => {
 };
 
 
-const defaultOptions$1 = {
+const defaultOptions$2 = {
   preserveOrder: false,
   attributeNamePrefix: '@_',
   attributesGroupName: false,
@@ -47775,6 +48381,7 @@ const defaultOptions$1 = {
   unpairedTags: [],
   processEntities: true,
   htmlEntities: false,
+  entityDecoder: null,
   ignoreDeclaration: false,
   ignorePiTags: false,
   transformTagName: false,
@@ -47821,18 +48428,19 @@ function validatePropertyName(propertyName, optionName) {
  * @param {boolean|object} value 
  * @returns {object} Always returns normalized object
  */
-function normalizeProcessEntities(value) {
+function normalizeProcessEntities(value, htmlEntities) {
   // Boolean backward compatibility
   if (typeof value === 'boolean') {
     return {
       enabled: value, // true or false
       maxEntitySize: 10000,
-      maxExpansionDepth: 10,
-      maxTotalExpansions: 1000,
+      maxExpansionDepth: 10000,
+      maxTotalExpansions: Infinity,
       maxExpandedLength: 100000,
-      maxEntityCount: 100,
+      maxEntityCount: 1000,
       allowedTags: null,
-      tagFilter: null
+      tagFilter: null,
+      appliesTo: "all",
     };
   }
 
@@ -47841,12 +48449,13 @@ function normalizeProcessEntities(value) {
     return {
       enabled: value.enabled !== false,
       maxEntitySize: Math.max(1, value.maxEntitySize ?? 10000),
-      maxExpansionDepth: Math.max(1, value.maxExpansionDepth ?? 10),
-      maxTotalExpansions: Math.max(1, value.maxTotalExpansions ?? 1000),
+      maxExpansionDepth: Math.max(1, value.maxExpansionDepth ?? 10000),
+      maxTotalExpansions: Math.max(1, value.maxTotalExpansions ?? Infinity),
       maxExpandedLength: Math.max(1, value.maxExpandedLength ?? 100000),
-      maxEntityCount: Math.max(1, value.maxEntityCount ?? 100),
+      maxEntityCount: Math.max(1, value.maxEntityCount ?? 1000),
       allowedTags: value.allowedTags ?? null,
-      tagFilter: value.tagFilter ?? null
+      tagFilter: value.tagFilter ?? null,
+      appliesTo: value.appliesTo ?? "all",
     };
   }
 
@@ -47855,7 +48464,7 @@ function normalizeProcessEntities(value) {
 }
 
 const buildOptions = function (options) {
-  const built = Object.assign({}, defaultOptions$1, options);
+  const built = Object.assign({}, defaultOptions$2, options);
 
   // Validate property names to prevent prototype pollution
   const propertyNameOptions = [
@@ -47877,8 +48486,8 @@ const buildOptions = function (options) {
   }
 
   // Always normalize processEntities for backward compatibility and validation
-  built.processEntities = normalizeProcessEntities(built.processEntities);
-
+  built.processEntities = normalizeProcessEntities(built.processEntities, built.htmlEntities);
+  built.unpairedTagsSet = new Set(built.unpairedTags);
   // Convert old-style stopNodes for backward compatibility
   if (built.stopNodes && Array.isArray(built.stopNodes)) {
     built.stopNodes = built.stopNodes.map(node => {
@@ -47968,11 +48577,8 @@ class DocTypeReader {
                                 );
                             }
                             //const escaped = entityName.replace(/[.\-+*:]/g, '\\.');
-                            const escaped = entityName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                            entities[entityName] = {
-                                regx: RegExp(`&${escaped};`, "g"),
-                                val: val
-                            };
+                            //const escaped = entityName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                            entities[entityName] = val;
                             entityCount++;
                         }
                     }
@@ -48540,11 +49146,11 @@ class Expression {
    * @param {Object} options - Configuration options
    * @param {string} options.separator - Path separator (default: '.')
    */
-  constructor(pattern, options = {}) {
+  constructor(pattern, options = {}, data) {
     this.pattern = pattern;
     this.separator = options.separator || '.';
     this.segments = this._parse(pattern);
-
+    this.data = data;
     // Cache expensive checks for performance (O(1) instead of O(n))
     this._hasDeepWildcard = this.segments.some(seg => seg.type === 'deep-wildcard');
     this._hasAttributeCondition = this.segments.some(seg => seg.attrName !== undefined);
@@ -48757,55 +49363,413 @@ class Expression {
 }
 
 /**
- * Matcher - Tracks current path in XML/JSON tree and matches against Expressions
- * 
+ * ExpressionSet - An indexed collection of Expressions for efficient bulk matching
+ *
+ * Instead of iterating all expressions on every tag, ExpressionSet pre-indexes
+ * them at insertion time by depth and terminal tag name. At match time, only
+ * the relevant bucket is evaluated — typically reducing checks from O(E) to O(1)
+ * lookup plus O(small bucket) matches.
+ *
+ * Three buckets are maintained:
+ *  - `_byDepthAndTag`  — exact depth + exact tag name  (tightest, used first)
+ *  - `_wildcardByDepth` — exact depth + wildcard tag `*` (depth-matched only)
+ *  - `_deepWildcards`  — expressions containing `..`  (cannot be depth-indexed)
+ *
+ * @example
+ * import { Expression, ExpressionSet } from 'fast-xml-tagger';
+ *
+ * // Build once at config time
+ * const stopNodes = new ExpressionSet();
+ * stopNodes.add(new Expression('root.users.user'));
+ * stopNodes.add(new Expression('root.config.setting'));
+ * stopNodes.add(new Expression('..script'));
+ *
+ * // Query on every tag — hot path
+ * if (stopNodes.matchesAny(matcher)) { ... }
+ */
+class ExpressionSet {
+  constructor() {
+    /** @type {Map<string, import('./Expression.js').default[]>} depth:tag → expressions */
+    this._byDepthAndTag = new Map();
+
+    /** @type {Map<number, import('./Expression.js').default[]>} depth → wildcard-tag expressions */
+    this._wildcardByDepth = new Map();
+
+    /** @type {import('./Expression.js').default[]} expressions containing deep wildcard (..) */
+    this._deepWildcards = [];
+
+    /** @type {Set<string>} pattern strings already added — used for deduplication */
+    this._patterns = new Set();
+
+    /** @type {boolean} whether the set is sealed against further additions */
+    this._sealed = false;
+  }
+
+  /**
+   * Add an Expression to the set.
+   * Duplicate patterns (same pattern string) are silently ignored.
+   *
+   * @param {import('./Expression.js').default} expression - A pre-constructed Expression instance
+   * @returns {this} for chaining
+   * @throws {TypeError} if called after seal()
+   *
+   * @example
+   * set.add(new Expression('root.users.user'));
+   * set.add(new Expression('..script'));
+   */
+  add(expression) {
+    if (this._sealed) {
+      throw new TypeError(
+        'ExpressionSet is sealed. Create a new ExpressionSet to add more expressions.'
+      );
+    }
+
+    // Deduplicate by pattern string
+    if (this._patterns.has(expression.pattern)) return this;
+    this._patterns.add(expression.pattern);
+
+    if (expression.hasDeepWildcard()) {
+      this._deepWildcards.push(expression);
+      return this;
+    }
+
+    const depth = expression.length;
+    const lastSeg = expression.segments[expression.segments.length - 1];
+    const tag = lastSeg?.tag;
+
+    if (!tag || tag === '*') {
+      // Can index by depth but not by tag
+      if (!this._wildcardByDepth.has(depth)) this._wildcardByDepth.set(depth, []);
+      this._wildcardByDepth.get(depth).push(expression);
+    } else {
+      // Tightest bucket: depth + tag
+      const key = `${depth}:${tag}`;
+      if (!this._byDepthAndTag.has(key)) this._byDepthAndTag.set(key, []);
+      this._byDepthAndTag.get(key).push(expression);
+    }
+
+    return this;
+  }
+
+  /**
+   * Add multiple expressions at once.
+   *
+   * @param {import('./Expression.js').default[]} expressions - Array of Expression instances
+   * @returns {this} for chaining
+   *
+   * @example
+   * set.addAll([
+   *   new Expression('root.users.user'),
+   *   new Expression('root.config.setting'),
+   * ]);
+   */
+  addAll(expressions) {
+    for (const expr of expressions) this.add(expr);
+    return this;
+  }
+
+  /**
+   * Check whether a pattern string is already present in the set.
+   *
+   * @param {import('./Expression.js').default} expression
+   * @returns {boolean}
+   */
+  has(expression) {
+    return this._patterns.has(expression.pattern);
+  }
+
+  /**
+   * Number of expressions in the set.
+   * @type {number}
+   */
+  get size() {
+    return this._patterns.size;
+  }
+
+  /**
+   * Seal the set against further modifications.
+   * Useful to prevent accidental mutations after config is built.
+   * Calling add() or addAll() on a sealed set throws a TypeError.
+   *
+   * @returns {this}
+   */
+  seal() {
+    this._sealed = true;
+    return this;
+  }
+
+  /**
+   * Whether the set has been sealed.
+   * @type {boolean}
+   */
+  get isSealed() {
+    return this._sealed;
+  }
+
+  /**
+   * Test whether the matcher's current path matches any expression in the set.
+   *
+   * Evaluation order (cheapest → most expensive):
+   *  1. Exact depth + tag bucket  — O(1) lookup, typically 0–2 expressions
+   *  2. Depth-only wildcard bucket — O(1) lookup, rare
+   *  3. Deep-wildcard list         — always checked, but usually small
+   *
+   * @param {import('./Matcher.js').default} matcher - Matcher instance (or readOnly view)
+   * @returns {boolean} true if any expression matches the current path
+   *
+   * @example
+   * if (stopNodes.matchesAny(matcher)) {
+   *   // handle stop node
+   * }
+   */
+  matchesAny(matcher) {
+    return this.findMatch(matcher) !== null;
+  }
+  /**
+ * Find and return the first Expression that matches the matcher's current path.
+ *
+ * Uses the same evaluation order as matchesAny (cheapest → most expensive):
+ *  1. Exact depth + tag bucket
+ *  2. Depth-only wildcard bucket
+ *  3. Deep-wildcard list
+ *
+ * @param {import('./Matcher.js').default} matcher - Matcher instance (or readOnly view)
+ * @returns {import('./Expression.js').default | null} the first matching Expression, or null
+ *
+ * @example
+ * const expr = stopNodes.findMatch(matcher);
+ * if (expr) {
+ *   // access expr.config, expr.pattern, etc.
+ * }
+ */
+  findMatch(matcher) {
+    const depth = matcher.getDepth();
+    const tag = matcher.getCurrentTag();
+
+    // 1. Tightest bucket — most expressions live here
+    const exactKey = `${depth}:${tag}`;
+    const exactBucket = this._byDepthAndTag.get(exactKey);
+    if (exactBucket) {
+      for (let i = 0; i < exactBucket.length; i++) {
+        if (matcher.matches(exactBucket[i])) return exactBucket[i];
+      }
+    }
+
+    // 2. Depth-matched wildcard-tag expressions
+    const wildcardBucket = this._wildcardByDepth.get(depth);
+    if (wildcardBucket) {
+      for (let i = 0; i < wildcardBucket.length; i++) {
+        if (matcher.matches(wildcardBucket[i])) return wildcardBucket[i];
+      }
+    }
+
+    // 3. Deep wildcards — cannot be pre-filtered by depth or tag
+    for (let i = 0; i < this._deepWildcards.length; i++) {
+      if (matcher.matches(this._deepWildcards[i])) return this._deepWildcards[i];
+    }
+
+    return null;
+  }
+}
+
+/**
+ * MatcherView - A lightweight read-only view over a Matcher's internal state.
+ *
+ * Created once by Matcher and reused across all callbacks. Holds a direct
+ * reference to the parent Matcher so it always reflects current parser state
+ * with zero copying or freezing overhead.
+ *
+ * Users receive this via {@link Matcher#readOnly} or directly from parser
+ * callbacks. It exposes all query and matching methods but has no mutation
+ * methods — misuse is caught at the TypeScript level rather than at runtime.
+ *
+ * @example
+ * const matcher = new Matcher();
+ * const view = matcher.readOnly();
+ *
+ * matcher.push("root", {});
+ * view.getCurrentTag(); // "root"
+ * view.getDepth();      // 1
+ */
+class MatcherView {
+  /**
+   * @param {Matcher} matcher - The parent Matcher instance to read from.
+   */
+  constructor(matcher) {
+    this._matcher = matcher;
+  }
+
+  /**
+   * Get the path separator used by the parent matcher.
+   * @returns {string}
+   */
+  get separator() {
+    return this._matcher.separator;
+  }
+
+  /**
+   * Get current tag name.
+   * @returns {string|undefined}
+   */
+  getCurrentTag() {
+    const path = this._matcher.path;
+    return path.length > 0 ? path[path.length - 1].tag : undefined;
+  }
+
+  /**
+   * Get current namespace.
+   * @returns {string|undefined}
+   */
+  getCurrentNamespace() {
+    const path = this._matcher.path;
+    return path.length > 0 ? path[path.length - 1].namespace : undefined;
+  }
+
+  /**
+   * Get current node's attribute value.
+   * @param {string} attrName
+   * @returns {*}
+   */
+  getAttrValue(attrName) {
+    const path = this._matcher.path;
+    if (path.length === 0) return undefined;
+    return path[path.length - 1].values?.[attrName];
+  }
+
+  /**
+   * Check if current node has an attribute.
+   * @param {string} attrName
+   * @returns {boolean}
+   */
+  hasAttr(attrName) {
+    const path = this._matcher.path;
+    if (path.length === 0) return false;
+    const current = path[path.length - 1];
+    return current.values !== undefined && attrName in current.values;
+  }
+
+  /**
+   * Get current node's sibling position (child index in parent).
+   * @returns {number}
+   */
+  getPosition() {
+    const path = this._matcher.path;
+    if (path.length === 0) return -1;
+    return path[path.length - 1].position ?? 0;
+  }
+
+  /**
+   * Get current node's repeat counter (occurrence count of this tag name).
+   * @returns {number}
+   */
+  getCounter() {
+    const path = this._matcher.path;
+    if (path.length === 0) return -1;
+    return path[path.length - 1].counter ?? 0;
+  }
+
+  /**
+   * Get current node's sibling index (alias for getPosition).
+   * @returns {number}
+   * @deprecated Use getPosition() or getCounter() instead
+   */
+  getIndex() {
+    return this.getPosition();
+  }
+
+  /**
+   * Get current path depth.
+   * @returns {number}
+   */
+  getDepth() {
+    return this._matcher.path.length;
+  }
+
+  /**
+   * Get path as string.
+   * @param {string} [separator] - Optional separator (uses default if not provided)
+   * @param {boolean} [includeNamespace=true]
+   * @returns {string}
+   */
+  toString(separator, includeNamespace = true) {
+    return this._matcher.toString(separator, includeNamespace);
+  }
+
+  /**
+   * Get path as array of tag names.
+   * @returns {string[]}
+   */
+  toArray() {
+    return this._matcher.path.map(n => n.tag);
+  }
+
+  /**
+   * Match current path against an Expression.
+   * @param {Expression} expression
+   * @returns {boolean}
+   */
+  matches(expression) {
+    return this._matcher.matches(expression);
+  }
+
+  /**
+   * Match any expression in the given set against the current path.
+   * @param {ExpressionSet} exprSet
+   * @returns {boolean}
+   */
+  matchesAny(exprSet) {
+    return exprSet.matchesAny(this._matcher);
+  }
+}
+
+/**
+ * Matcher - Tracks current path in XML/JSON tree and matches against Expressions.
+ *
  * The matcher maintains a stack of nodes representing the current path from root to
  * current tag. It only stores attribute values for the current (top) node to minimize
  * memory usage. Sibling tracking is used to auto-calculate position and counter.
- * 
+ *
+ * Use {@link Matcher#readOnly} to obtain a {@link MatcherView} safe to pass to
+ * user callbacks — it always reflects current state with no Proxy overhead.
+ *
  * @example
  * const matcher = new Matcher();
  * matcher.push("root", {});
  * matcher.push("users", {});
  * matcher.push("user", { id: "123", type: "admin" });
- * 
+ *
  * const expr = new Expression("root.users.user");
  * matcher.matches(expr); // true
  */
-
-/**
- * Names of methods that mutate Matcher state.
- * Any attempt to call these on a read-only view throws a TypeError.
- * @type {Set<string>}
- */
-const MUTATING_METHODS = new Set(['push', 'pop', 'reset', 'updateCurrent', 'restore']);
-
 class Matcher {
   /**
-   * Create a new Matcher
-   * @param {Object} options - Configuration options
-   * @param {string} options.separator - Default path separator (default: '.')
+   * Create a new Matcher.
+   * @param {Object} [options={}]
+   * @param {string} [options.separator='.'] - Default path separator
    */
   constructor(options = {}) {
     this.separator = options.separator || '.';
     this.path = [];
     this.siblingStacks = [];
-    // Each path node: { tag: string, values: object, position: number, counter: number }
+    // Each path node: { tag, values, position, counter, namespace? }
     // values only present for current (last) node
     // Each siblingStacks entry: Map<tagName, count> tracking occurrences at each level
+    this._pathStringCache = null;
+    this._view = new MatcherView(this);
   }
 
   /**
-   * Push a new tag onto the path
-   * @param {string} tagName - Name of the tag
-   * @param {Object} attrValues - Attribute key-value pairs for current node (optional)
-   * @param {string} namespace - Namespace for the tag (optional)
+   * Push a new tag onto the path.
+   * @param {string} tagName
+   * @param {Object|null} [attrValues=null]
+   * @param {string|null} [namespace=null]
    */
   push(tagName, attrValues = null, namespace = null) {
+    this._pathStringCache = null;
+
     // Remove values from previous current node (now becoming ancestor)
     if (this.path.length > 0) {
-      const prev = this.path[this.path.length - 1];
-      prev.values = undefined;
+      this.path[this.path.length - 1].values = undefined;
     }
 
     // Get or create sibling tracking for current level
@@ -48838,12 +49802,10 @@ class Matcher {
       counter: counter
     };
 
-    // Store namespace if provided
     if (namespace !== null && namespace !== undefined) {
       node.namespace = namespace;
     }
 
-    // Store values only for current node
     if (attrValues !== null && attrValues !== undefined) {
       node.values = attrValues;
     }
@@ -48852,19 +49814,15 @@ class Matcher {
   }
 
   /**
-   * Pop the last tag from the path
+   * Pop the last tag from the path.
    * @returns {Object|undefined} The popped node
    */
   pop() {
-    if (this.path.length === 0) {
-      return undefined;
-    }
+    if (this.path.length === 0) return undefined;
+    this._pathStringCache = null;
 
     const node = this.path.pop();
 
-    // Clean up sibling tracking for levels deeper than current
-    // After pop, path.length is the new depth
-    // We need to clean up siblingStacks[path.length + 1] and beyond
     if (this.siblingStacks.length > this.path.length + 1) {
       this.siblingStacks.length = this.path.length + 1;
     }
@@ -48873,9 +49831,9 @@ class Matcher {
   }
 
   /**
-   * Update current node's attribute values
-   * Useful when attributes are parsed after push
-   * @param {Object} attrValues - Attribute values
+   * Update current node's attribute values.
+   * Useful when attributes are parsed after push.
+   * @param {Object} attrValues
    */
   updateCurrent(attrValues) {
     if (this.path.length > 0) {
@@ -48887,7 +49845,7 @@ class Matcher {
   }
 
   /**
-   * Get current tag name
+   * Get current tag name.
    * @returns {string|undefined}
    */
   getCurrentTag() {
@@ -48895,7 +49853,7 @@ class Matcher {
   }
 
   /**
-   * Get current namespace
+   * Get current namespace.
    * @returns {string|undefined}
    */
   getCurrentNamespace() {
@@ -48903,19 +49861,18 @@ class Matcher {
   }
 
   /**
-   * Get current node's attribute value
-   * @param {string} attrName - Attribute name
-   * @returns {*} Attribute value or undefined
+   * Get current node's attribute value.
+   * @param {string} attrName
+   * @returns {*}
    */
   getAttrValue(attrName) {
     if (this.path.length === 0) return undefined;
-    const current = this.path[this.path.length - 1];
-    return current.values?.[attrName];
+    return this.path[this.path.length - 1].values?.[attrName];
   }
 
   /**
-   * Check if current node has an attribute
-   * @param {string} attrName - Attribute name
+   * Check if current node has an attribute.
+   * @param {string} attrName
    * @returns {boolean}
    */
   hasAttr(attrName) {
@@ -48925,7 +49882,7 @@ class Matcher {
   }
 
   /**
-   * Get current node's sibling position (child index in parent)
+   * Get current node's sibling position (child index in parent).
    * @returns {number}
    */
   getPosition() {
@@ -48934,7 +49891,7 @@ class Matcher {
   }
 
   /**
-   * Get current node's repeat counter (occurrence count of this tag name)
+   * Get current node's repeat counter (occurrence count of this tag name).
    * @returns {number}
    */
   getCounter() {
@@ -48943,7 +49900,7 @@ class Matcher {
   }
 
   /**
-   * Get current node's sibling index (alias for getPosition for backward compatibility)
+   * Get current node's sibling index (alias for getPosition).
    * @returns {number}
    * @deprecated Use getPosition() or getCounter() instead
    */
@@ -48952,7 +49909,7 @@ class Matcher {
   }
 
   /**
-   * Get current path depth
+   * Get current path depth.
    * @returns {number}
    */
   getDepth() {
@@ -48960,23 +49917,33 @@ class Matcher {
   }
 
   /**
-   * Get path as string
-   * @param {string} separator - Optional separator (uses default if not provided)
-   * @param {boolean} includeNamespace - Whether to include namespace in output (default: true)
+   * Get path as string.
+   * @param {string} [separator] - Optional separator (uses default if not provided)
+   * @param {boolean} [includeNamespace=true]
    * @returns {string}
    */
   toString(separator, includeNamespace = true) {
     const sep = separator || this.separator;
-    return this.path.map(n => {
-      if (includeNamespace && n.namespace) {
-        return `${n.namespace}:${n.tag}`;
+    const isDefault = (sep === this.separator && includeNamespace === true);
+
+    if (isDefault) {
+      if (this._pathStringCache !== null) {
+        return this._pathStringCache;
       }
-      return n.tag;
-    }).join(sep);
+      const result = this.path.map(n =>
+        (n.namespace) ? `${n.namespace}:${n.tag}` : n.tag
+      ).join(sep);
+      this._pathStringCache = result;
+      return result;
+    }
+
+    return this.path.map(n =>
+      (includeNamespace && n.namespace) ? `${n.namespace}:${n.tag}` : n.tag
+    ).join(sep);
   }
 
   /**
-   * Get path as array of tag names
+   * Get path as array of tag names.
    * @returns {string[]}
    */
   toArray() {
@@ -48984,17 +49951,18 @@ class Matcher {
   }
 
   /**
-   * Reset the path to empty
+   * Reset the path to empty.
    */
   reset() {
+    this._pathStringCache = null;
     this.path = [];
     this.siblingStacks = [];
   }
 
   /**
-   * Match current path against an Expression
-   * @param {Expression} expression - The expression to match against
-   * @returns {boolean} True if current path matches the expression
+   * Match current path against an Expression.
+   * @param {Expression} expression
+   * @returns {boolean}
    */
   matches(expression) {
     const segments = expression.segments;
@@ -49003,32 +49971,23 @@ class Matcher {
       return false;
     }
 
-    // Handle deep wildcard patterns
     if (expression.hasDeepWildcard()) {
       return this._matchWithDeepWildcard(segments);
     }
 
-    // Simple path matching (no deep wildcards)
     return this._matchSimple(segments);
   }
 
   /**
-   * Match simple path (no deep wildcards)
    * @private
    */
   _matchSimple(segments) {
-    // Path must be same length as segments
     if (this.path.length !== segments.length) {
       return false;
     }
 
-    // Match each segment bottom-to-top
     for (let i = 0; i < segments.length; i++) {
-      const segment = segments[i];
-      const node = this.path[i];
-      const isCurrentNode = (i === this.path.length - 1);
-
-      if (!this._matchSegment(segment, node, isCurrentNode)) {
+      if (!this._matchSegment(segments[i], this.path[i], i === this.path.length - 1)) {
         return false;
       }
     }
@@ -49037,32 +49996,27 @@ class Matcher {
   }
 
   /**
-   * Match path with deep wildcards
    * @private
    */
   _matchWithDeepWildcard(segments) {
-    let pathIdx = this.path.length - 1;  // Start from current node (bottom)
-    let segIdx = segments.length - 1;     // Start from last segment
+    let pathIdx = this.path.length - 1;
+    let segIdx = segments.length - 1;
 
     while (segIdx >= 0 && pathIdx >= 0) {
       const segment = segments[segIdx];
 
       if (segment.type === 'deep-wildcard') {
-        // ".." matches zero or more levels
         segIdx--;
 
         if (segIdx < 0) {
-          // Pattern ends with "..", always matches
           return true;
         }
 
-        // Find where next segment matches in the path
         const nextSeg = segments[segIdx];
         let found = false;
 
         for (let i = pathIdx; i >= 0; i--) {
-          const isCurrentNode = (i === this.path.length - 1);
-          if (this._matchSegment(nextSeg, this.path[i], isCurrentNode)) {
+          if (this._matchSegment(nextSeg, this.path[i], i === this.path.length - 1)) {
             pathIdx = i - 1;
             segIdx--;
             found = true;
@@ -49074,9 +50028,7 @@ class Matcher {
           return false;
         }
       } else {
-        // Regular segment
-        const isCurrentNode = (pathIdx === this.path.length - 1);
-        if (!this._matchSegment(segment, this.path[pathIdx], isCurrentNode)) {
+        if (!this._matchSegment(segment, this.path[pathIdx], pathIdx === this.path.length - 1)) {
           return false;
         }
         pathIdx--;
@@ -49084,38 +50036,25 @@ class Matcher {
       }
     }
 
-    // All segments must be consumed
     return segIdx < 0;
   }
 
   /**
-   * Match a single segment against a node
    * @private
-   * @param {Object} segment - Segment from Expression
-   * @param {Object} node - Node from path
-   * @param {boolean} isCurrentNode - Whether this is the current (last) node
-   * @returns {boolean}
    */
   _matchSegment(segment, node, isCurrentNode) {
-    // Match tag name (* is wildcard)
     if (segment.tag !== '*' && segment.tag !== node.tag) {
       return false;
     }
 
-    // Match namespace if specified in segment
     if (segment.namespace !== undefined) {
-      // Segment has namespace - node must match it
       if (segment.namespace !== '*' && segment.namespace !== node.namespace) {
         return false;
       }
     }
-    // If segment has no namespace, it matches nodes with or without namespace
 
-    // Match attribute name (check if node has this attribute)
-    // Can only check for current node since ancestors don't have values
     if (segment.attrName !== undefined) {
       if (!isCurrentNode) {
-        // Can't check attributes for ancestor nodes (values not stored)
         return false;
       }
 
@@ -49123,20 +50062,15 @@ class Matcher {
         return false;
       }
 
-      // Match attribute value (only possible for current node)
       if (segment.attrValue !== undefined) {
-        const actualValue = node.values[segment.attrName];
-        // Both should be strings
-        if (String(actualValue) !== String(segment.attrValue)) {
+        if (String(node.values[segment.attrName]) !== String(segment.attrValue)) {
           return false;
         }
       }
     }
 
-    // Match position (only for current node)
     if (segment.position !== undefined) {
       if (!isCurrentNode) {
-        // Can't check position for ancestor nodes
         return false;
       }
 
@@ -49148,10 +50082,8 @@ class Matcher {
         return false;
       } else if (segment.position === 'even' && counter % 2 !== 0) {
         return false;
-      } else if (segment.position === 'nth') {
-        if (counter !== segment.positionValue) {
-          return false;
-        }
+      } else if (segment.position === 'nth' && counter !== segment.positionValue) {
+        return false;
       }
     }
 
@@ -49159,8 +50091,17 @@ class Matcher {
   }
 
   /**
-   * Create a snapshot of current state
-   * @returns {Object} State snapshot
+   * Match any expression in the given set against the current path.
+   * @param {ExpressionSet} exprSet
+   * @returns {boolean}
+   */
+  matchesAny(exprSet) {
+    return exprSet.matchesAny(this);
+  }
+
+  /**
+   * Create a snapshot of current state.
+   * @returns {Object}
    */
   snapshot() {
     return {
@@ -49170,88 +50111,33 @@ class Matcher {
   }
 
   /**
-   * Restore state from snapshot
-   * @param {Object} snapshot - State snapshot
+   * Restore state from snapshot.
+   * @param {Object} snapshot
    */
   restore(snapshot) {
+    this._pathStringCache = null;
     this.path = snapshot.path.map(node => ({ ...node }));
     this.siblingStacks = snapshot.siblingStacks.map(map => new Map(map));
   }
 
   /**
-   * Return a read-only view of this matcher.
+   * Return the read-only {@link MatcherView} for this matcher.
    *
-   * The returned object exposes all query/inspection methods but throws a
-   * TypeError if any state-mutating method is called (`push`, `pop`, `reset`,
-   * `updateCurrent`, `restore`).  Property reads (e.g. `.path`, `.separator`)
-   * are allowed but the returned arrays/objects are frozen so callers cannot
-   * mutate internal state through them either.
+   * The same instance is returned on every call — no allocation occurs.
+   * It always reflects the current parser state and is safe to pass to
+   * user callbacks without risk of accidental mutation.
    *
-   * @returns {ReadOnlyMatcher} A proxy that forwards read operations and blocks writes.
+   * @returns {MatcherView}
    *
    * @example
-   * const matcher = new Matcher();
-   * matcher.push("root", {});
-   *
-   * const ro = matcher.readOnly();
-   * ro.matches(expr);      // ✓ works
-   * ro.getCurrentTag();    // ✓ works
-   * ro.push("child", {}); // ✗ throws TypeError
-   * ro.reset();            // ✗ throws TypeError
+   * const view = matcher.readOnly();
+   * // pass view to callbacks — it stays in sync automatically
+   * view.matches(expr);       // ✓
+   * view.getCurrentTag();     // ✓
+   * // view.push(...)         // ✗ method does not exist — caught by TypeScript
    */
   readOnly() {
-    const self = this;
-
-    return new Proxy(self, {
-      get(target, prop, receiver) {
-        // Block mutating methods
-        if (MUTATING_METHODS.has(prop)) {
-          return () => {
-            throw new TypeError(
-              `Cannot call '${prop}' on a read-only Matcher. ` +
-              `Obtain a writable instance to mutate state.`
-            );
-          };
-        }
-
-        const value = Reflect.get(target, prop, receiver);
-
-        // Freeze array/object properties so callers can't mutate internal
-        // state through direct property access (e.g. matcher.path.push(...))
-        if (prop === 'path' || prop === 'siblingStacks') {
-          return Object.freeze(
-            Array.isArray(value)
-              ? value.map(item =>
-                item instanceof Map
-                  ? Object.freeze(new Map(item))   // freeze a copy of each Map
-                  : Object.freeze({ ...item })      // freeze a copy of each node
-              )
-              : value
-          );
-        }
-
-        // Bind methods so `this` inside them still refers to the real Matcher
-        if (typeof value === 'function') {
-          return value.bind(target);
-        }
-
-        return value;
-      },
-
-      // Prevent any property assignment on the read-only view
-      set(_target, prop) {
-        throw new TypeError(
-          `Cannot set property '${String(prop)}' on a read-only Matcher.`
-        );
-      },
-
-      // Prevent property deletion
-      deleteProperty(_target, prop) {
-        throw new TypeError(
-          `Cannot delete property '${String(prop)}' from a read-only Matcher.`
-        );
-      }
-    });
+    return this._view;
   }
 }
 
@@ -49318,32 +50204,6 @@ class OrderedObjParser {
     this.options = options;
     this.currentNode = null;
     this.tagsNodeStack = [];
-    this.docTypeEntities = {};
-    this.lastEntities = {
-      "apos": { regex: /&(apos|#39|#x27);/g, val: "'" },
-      "gt": { regex: /&(gt|#62|#x3E);/g, val: ">" },
-      "lt": { regex: /&(lt|#60|#x3C);/g, val: "<" },
-      "quot": { regex: /&(quot|#34|#x22);/g, val: "\"" },
-    };
-    this.ampEntity = { regex: /&(amp|#38|#x26);/g, val: "&" };
-    this.htmlEntities = {
-      "space": { regex: /&(nbsp|#160);/g, val: " " },
-      // "lt" : { regex: /&(lt|#60);/g, val: "<" },
-      // "gt" : { regex: /&(gt|#62);/g, val: ">" },
-      // "amp" : { regex: /&(amp|#38);/g, val: "&" },
-      // "quot" : { regex: /&(quot|#34);/g, val: "\"" },
-      // "apos" : { regex: /&(apos|#39);/g, val: "'" },
-      "cent": { regex: /&(cent|#162);/g, val: "¢" },
-      "pound": { regex: /&(pound|#163);/g, val: "£" },
-      "yen": { regex: /&(yen|#165);/g, val: "¥" },
-      "euro": { regex: /&(euro|#8364);/g, val: "€" },
-      "copyright": { regex: /&(copy|#169);/g, val: "©" },
-      "reg": { regex: /&(reg|#174);/g, val: "®" },
-      "inr": { regex: /&(inr|#8377);/g, val: "₹" },
-      "num_dec": { regex: /&#([0-9]{1,7});/g, val: (_, str) => fromCodePoint(str, 10, "&#") },
-      "num_hex": { regex: /&#x([0-9a-fA-F]{1,6});/g, val: (_, str) => fromCodePoint(str, 16, "&#x") },
-    };
-    this.addExternalEntities = addExternalEntities;
     this.parseXml = parseXml;
     this.parseTextData = parseTextData;
     this.resolveNameSpace = resolveNameSpace;
@@ -49356,6 +50216,23 @@ class OrderedObjParser {
     this.ignoreAttributesFn = getIgnoreAttributesFn$1(this.options.ignoreAttributes);
     this.entityExpansionCount = 0;
     this.currentExpandedLength = 0;
+    let namedEntities = { ...XML };
+    if (this.options.entityDecoder) {
+      this.entityDecoder = this.options.entityDecoder;
+    } else {
+      if (typeof this.options.htmlEntities === "object") namedEntities = this.options.htmlEntities;
+      else if (this.options.htmlEntities === true) namedEntities = { ...COMMON_HTML, ...CURRENCY };
+      this.entityDecoder = new EntityDecoder({
+        namedEntities: namedEntities,
+        numericAllowed: this.options.htmlEntities,
+        limit: {
+          maxTotalExpansions: this.options.processEntities.maxTotalExpansions,
+          maxExpandedLength: this.options.processEntities.maxExpandedLength,
+          applyLimitsTo: this.options.processEntities.appliesTo,
+        }
+        //postCheck: resolved => resolved
+      });
+    }
 
     // Initialize path matcher for path-expression-matcher
     this.matcher = new Matcher();
@@ -49368,34 +50245,25 @@ class OrderedObjParser {
     this.isCurrentNodeStopNode = false;
 
     // Pre-compile stopNodes expressions
-    if (this.options.stopNodes && this.options.stopNodes.length > 0) {
-      this.stopNodeExpressions = [];
-      for (let i = 0; i < this.options.stopNodes.length; i++) {
-        const stopNodeExp = this.options.stopNodes[i];
+    this.stopNodeExpressionsSet = new ExpressionSet();
+    const stopNodesOpts = this.options.stopNodes;
+    if (stopNodesOpts && stopNodesOpts.length > 0) {
+      for (let i = 0; i < stopNodesOpts.length; i++) {
+        const stopNodeExp = stopNodesOpts[i];
         if (typeof stopNodeExp === 'string') {
           // Convert string to Expression object
-          this.stopNodeExpressions.push(new Expression(stopNodeExp));
+          this.stopNodeExpressionsSet.add(new Expression(stopNodeExp));
         } else if (stopNodeExp instanceof Expression) {
           // Already an Expression object
-          this.stopNodeExpressions.push(stopNodeExp);
+          this.stopNodeExpressionsSet.add(stopNodeExp);
         }
       }
+      this.stopNodeExpressionsSet.seal();
     }
   }
 
 }
 
-function addExternalEntities(externalEntities) {
-  const entKeys = Object.keys(externalEntities);
-  for (let i = 0; i < entKeys.length; i++) {
-    const ent = entKeys[i];
-    const escaped = ent.replace(/[.\-+*:]/g, '\\.');
-    this.lastEntities[ent] = {
-      regex: new RegExp("&" + escaped + ";", "g"),
-      val: externalEntities[ent]
-    };
-  }
-}
 
 /**
  * @param {string} val
@@ -49407,28 +50275,29 @@ function addExternalEntities(externalEntities) {
  * @param {boolean} escapeEntities
  */
 function parseTextData(val, tagName, jPath, dontTrim, hasAttributes, isLeafNode, escapeEntities) {
+  const options = this.options;
   if (val !== undefined) {
-    if (this.options.trimValues && !dontTrim) {
+    if (options.trimValues && !dontTrim) {
       val = val.trim();
     }
     if (val.length > 0) {
       if (!escapeEntities) val = this.replaceEntitiesValue(val, tagName, jPath);
 
       // Pass jPath string or matcher based on options.jPath setting
-      const jPathOrMatcher = this.options.jPath ? jPath.toString() : jPath;
-      const newval = this.options.tagValueProcessor(tagName, val, jPathOrMatcher, hasAttributes, isLeafNode);
+      const jPathOrMatcher = options.jPath ? jPath.toString() : jPath;
+      const newval = options.tagValueProcessor(tagName, val, jPathOrMatcher, hasAttributes, isLeafNode);
       if (newval === null || newval === undefined) {
         //don't parse
         return val;
       } else if (typeof newval !== typeof val || newval !== val) {
         //overwrite
         return newval;
-      } else if (this.options.trimValues) {
-        return parseValue(val, this.options.parseTagValue, this.options.numberParseOptions);
+      } else if (options.trimValues) {
+        return parseValue(val, options.parseTagValue, options.numberParseOptions);
       } else {
         const trimmedVal = val.trim();
         if (trimmedVal === val) {
-          return parseValue(val, this.options.parseTagValue, this.options.numberParseOptions);
+          return parseValue(val, options.parseTagValue, options.numberParseOptions);
         } else {
           return val;
         }
@@ -49455,8 +50324,9 @@ function resolveNameSpace(tagname) {
 //const attrsRegx = new RegExp("([\\w\\-\\.\\:]+)\\s*=\\s*(['\"])((.|\n)*?)\\2","gm");
 const attrsRegx = new RegExp('([^\\s=]+)\\s*(=\\s*([\'"])([\\s\\S]*?)\\3)?', 'gm');
 
-function buildAttributesMap(attrStr, jPath, tagName) {
-  if (this.options.ignoreAttributes !== true && typeof attrStr === 'string') {
+function buildAttributesMap(attrStr, jPath, tagName, force = false) {
+  const options = this.options;
+  if (force === true || (options.ignoreAttributes !== true && typeof attrStr === 'string')) {
     // attrStr = attrStr.replace(/\r?\n/g, ' ');
     //attrStr = attrStr || attrStr.trim();
 
@@ -49464,89 +50334,80 @@ function buildAttributesMap(attrStr, jPath, tagName) {
     const len = matches.length; //don't make it inline
     const attrs = {};
 
-    // First pass: parse all attributes and update matcher with raw values
-    // This ensures the matcher has all attribute values when processors run
+    // Pre-process values once: trim + entity replacement
+    // Reused in both matcher update and second pass
+    const processedVals = new Array(len);
+    let hasRawAttrs = false;
     const rawAttrsForMatcher = {};
+
     for (let i = 0; i < len; i++) {
       const attrName = this.resolveNameSpace(matches[i][1]);
       const oldVal = matches[i][4];
 
       if (attrName.length && oldVal !== undefined) {
-        let parsedVal = oldVal;
-        if (this.options.trimValues) {
-          parsedVal = parsedVal.trim();
-        }
-        parsedVal = this.replaceEntitiesValue(parsedVal, tagName, this.readonlyMatcher);
-        rawAttrsForMatcher[attrName] = parsedVal;
+        let val = oldVal;
+        if (options.trimValues) val = val.trim();
+        val = this.replaceEntitiesValue(val, tagName, this.readonlyMatcher);
+        processedVals[i] = val;
+
+        rawAttrsForMatcher[attrName] = val;
+        hasRawAttrs = true;
       }
     }
 
-    // Update matcher with raw attribute values BEFORE running processors
-    if (Object.keys(rawAttrsForMatcher).length > 0 && typeof jPath === 'object' && jPath.updateCurrent) {
+    // Update matcher ONCE before second pass, if applicable
+    if (hasRawAttrs && typeof jPath === 'object' && jPath.updateCurrent) {
       jPath.updateCurrent(rawAttrsForMatcher);
     }
 
-    // Second pass: now process attributes with matcher having full attribute context
+    // Hoist toString() once — path doesn't change during attribute processing
+    const jPathStr = options.jPath ? jPath.toString() : this.readonlyMatcher;
+
+    // Second pass: apply processors, build final attrs
+    let hasAttrs = false;
     for (let i = 0; i < len; i++) {
       const attrName = this.resolveNameSpace(matches[i][1]);
 
-      // Convert jPath to string if needed for ignoreAttributesFn
-      const jPathStr = this.options.jPath ? jPath.toString() : this.readonlyMatcher;
-      if (this.ignoreAttributesFn(attrName, jPathStr)) {
-        continue
-      }
+      if (this.ignoreAttributesFn(attrName, jPathStr)) continue;
 
-      let oldVal = matches[i][4];
-      let aName = this.options.attributeNamePrefix + attrName;
+      let aName = options.attributeNamePrefix + attrName;
 
       if (attrName.length) {
-        if (this.options.transformAttributeName) {
-          aName = this.options.transformAttributeName(aName);
+        if (options.transformAttributeName) {
+          aName = options.transformAttributeName(aName);
         }
-        //if (aName === "__proto__") aName = "#__proto__";
-        aName = sanitizeName(aName, this.options);
+        aName = sanitizeName(aName, options);
 
-        if (oldVal !== undefined) {
-          if (this.options.trimValues) {
-            oldVal = oldVal.trim();
-          }
-          oldVal = this.replaceEntitiesValue(oldVal, tagName, this.readonlyMatcher);
+        if (matches[i][4] !== undefined) {
+          // Reuse already-processed value — no double entity replacement
+          const oldVal = processedVals[i];
 
-          // Pass jPath string or readonlyMatcher based on options.jPath setting
-          const jPathOrMatcher = this.options.jPath ? jPath.toString() : this.readonlyMatcher;
-          const newVal = this.options.attributeValueProcessor(attrName, oldVal, jPathOrMatcher);
+          const newVal = options.attributeValueProcessor(attrName, oldVal, jPathStr);
           if (newVal === null || newVal === undefined) {
-            //don't parse
             attrs[aName] = oldVal;
           } else if (typeof newVal !== typeof oldVal || newVal !== oldVal) {
-            //overwrite
             attrs[aName] = newVal;
           } else {
-            //parse
-            attrs[aName] = parseValue(
-              oldVal,
-              this.options.parseAttributeValue,
-              this.options.numberParseOptions
-            );
+            attrs[aName] = parseValue(oldVal, options.parseAttributeValue, options.numberParseOptions);
           }
-        } else if (this.options.allowBooleanAttributes) {
+          hasAttrs = true;
+        } else if (options.allowBooleanAttributes) {
           attrs[aName] = true;
+          hasAttrs = true;
         }
       }
     }
 
-    if (!Object.keys(attrs).length) {
-      return;
-    }
-    if (this.options.attributesGroupName) {
+    if (!hasAttrs) return;
+
+    if (options.attributesGroupName) {
       const attrCollection = {};
-      attrCollection[this.options.attributesGroupName] = attrs;
+      attrCollection[options.attributesGroupName] = attrs;
       return attrCollection;
     }
-    return attrs
+    return attrs;
   }
 }
-
 const parseXml = function (xmlData) {
   xmlData = xmlData.replace(/\r\n?/g, "\n"); //TODO: remove this line
   const xmlObj = new XmlNode('!xml');
@@ -49555,29 +50416,32 @@ const parseXml = function (xmlData) {
 
   // Reset matcher for new document
   this.matcher.reset();
+  this.entityDecoder.reset();
 
   // Reset entity expansion counters for this document
   this.entityExpansionCount = 0;
   this.currentExpandedLength = 0;
-
-  const docTypeReader = new DocTypeReader(this.options.processEntities);
-  for (let i = 0; i < xmlData.length; i++) {//for each char in XML data
+  const options = this.options;
+  const docTypeReader = new DocTypeReader(options.processEntities);
+  const xmlLen = xmlData.length;
+  for (let i = 0; i < xmlLen; i++) {//for each char in XML data
     const ch = xmlData[i];
     if (ch === '<') {
       // const nextIndex = i+1;
       // const _2ndChar = xmlData[nextIndex];
-      if (xmlData[i + 1] === '/') {//Closing Tag
+      const c1 = xmlData.charCodeAt(i + 1);
+      if (c1 === 47) {//Closing Tag '/'
         const closeIndex = findClosingIndex(xmlData, ">", i, "Closing Tag is not closed.");
         let tagName = xmlData.substring(i + 2, closeIndex).trim();
 
-        if (this.options.removeNSPrefix) {
+        if (options.removeNSPrefix) {
           const colonIndex = tagName.indexOf(":");
           if (colonIndex !== -1) {
             tagName = tagName.substr(colonIndex + 1);
           }
         }
 
-        tagName = transformTagName(this.options.transformTagName, tagName, "", this.options).tagName;
+        tagName = transformTagName(options.transformTagName, tagName, "", options).tagName;
 
         if (currentNode) {
           textData = this.saveTextToParentTag(textData, currentNode, this.readonlyMatcher);
@@ -49585,10 +50449,10 @@ const parseXml = function (xmlData) {
 
         //check if last tag of nested tag was unpaired tag
         const lastTagName = this.matcher.getCurrentTag();
-        if (tagName && this.options.unpairedTags.indexOf(tagName) !== -1) {
+        if (tagName && options.unpairedTagsSet.has(tagName)) {
           throw new Error(`Unpaired tag can not be used as closing tag: </${tagName}>`);
         }
-        if (lastTagName && this.options.unpairedTags.indexOf(lastTagName) !== -1) {
+        if (lastTagName && options.unpairedTagsSet.has(lastTagName)) {
           // Pop the unpaired tag
           this.matcher.pop();
           this.tagsNodeStack.pop();
@@ -49600,40 +50464,49 @@ const parseXml = function (xmlData) {
         currentNode = this.tagsNodeStack.pop();//avoid recursion, set the parent tag scope
         textData = "";
         i = closeIndex;
-      } else if (xmlData[i + 1] === '?') {
+      } else if (c1 === 63) { //'?'
 
         let tagData = readTagExp(xmlData, i, false, "?>");
         if (!tagData) throw new Error("Pi Tag is not closed.");
 
         textData = this.saveTextToParentTag(textData, currentNode, this.readonlyMatcher);
-        if ((this.options.ignoreDeclaration && tagData.tagName === "?xml") || this.options.ignorePiTags) ; else {
+        const attsMap = this.buildAttributesMap(tagData.tagExp, this.matcher, tagData.tagName, true);
+        if (attsMap) {
+          const ver = attsMap[this.options.attributeNamePrefix + "version"];
+          this.entityDecoder.setXmlVersion(Number(ver) || 1.0);
+        }
+        if ((options.ignoreDeclaration && tagData.tagName === "?xml") || options.ignorePiTags) ; else {
 
           const childNode = new XmlNode(tagData.tagName);
-          childNode.add(this.options.textNodeName, "");
+          childNode.add(options.textNodeName, "");
 
-          if (tagData.tagName !== tagData.tagExp && tagData.attrExpPresent) {
-            childNode[":@"] = this.buildAttributesMap(tagData.tagExp, this.matcher, tagData.tagName);
+          if (tagData.tagName !== tagData.tagExp && tagData.attrExpPresent && options.ignoreAttributes !== true) {
+            childNode[":@"] = attsMap;
           }
           this.addChild(currentNode, childNode, this.readonlyMatcher, i);
         }
 
 
         i = tagData.closeIndex + 1;
-      } else if (xmlData.substr(i + 1, 3) === '!--') {
+      } else if (c1 === 33
+        && xmlData.charCodeAt(i + 2) === 45
+        && xmlData.charCodeAt(i + 3) === 45) { //'!--'
         const endIndex = findClosingIndex(xmlData, "-->", i + 4, "Comment is not closed.");
-        if (this.options.commentPropName) {
+        if (options.commentPropName) {
           const comment = xmlData.substring(i + 4, endIndex - 2);
 
           textData = this.saveTextToParentTag(textData, currentNode, this.readonlyMatcher);
 
-          currentNode.add(this.options.commentPropName, [{ [this.options.textNodeName]: comment }]);
+          currentNode.add(options.commentPropName, [{ [options.textNodeName]: comment }]);
         }
         i = endIndex;
-      } else if (xmlData.substr(i + 1, 2) === '!D') {
+      } else if (c1 === 33
+        && xmlData.charCodeAt(i + 2) === 68) { //'!D'
         const result = docTypeReader.readDocType(xmlData, i);
-        this.docTypeEntities = result.entities;
+        this.entityDecoder.addInputEntities(result.entities);
         i = result.i;
-      } else if (xmlData.substr(i + 1, 2) === '![') {
+      } else if (c1 === 33
+        && xmlData.charCodeAt(i + 2) === 91) { // '!['
         const closeIndex = findClosingIndex(xmlData, "]]>", i, "CDATA is not closed.") - 2;
         const tagExp = xmlData.substring(i + 9, closeIndex);
 
@@ -49643,20 +50516,20 @@ const parseXml = function (xmlData) {
         if (val == undefined) val = "";
 
         //cdata should be set even if it is 0 length string
-        if (this.options.cdataPropName) {
-          currentNode.add(this.options.cdataPropName, [{ [this.options.textNodeName]: tagExp }]);
+        if (options.cdataPropName) {
+          currentNode.add(options.cdataPropName, [{ [options.textNodeName]: tagExp }]);
         } else {
-          currentNode.add(this.options.textNodeName, val);
+          currentNode.add(options.textNodeName, val);
         }
 
         i = closeIndex + 2;
       } else {//Opening tag
-        let result = readTagExp(xmlData, i, this.options.removeNSPrefix);
+        let result = readTagExp(xmlData, i, options.removeNSPrefix);
 
         // Safety check: readTagExp can return undefined
         if (!result) {
           // Log context for debugging
-          const context = xmlData.substring(Math.max(0, i - 50), Math.min(xmlData.length, i + 50));
+          const context = xmlData.substring(Math.max(0, i - 50), Math.min(xmlLen, i + 50));
           throw new Error(`readTagExp returned undefined at position ${i}. Context: "${context}"`);
         }
 
@@ -49666,13 +50539,13 @@ const parseXml = function (xmlData) {
         let attrExpPresent = result.attrExpPresent;
         let closeIndex = result.closeIndex;
 
-        ({ tagName, tagExp } = transformTagName(this.options.transformTagName, tagName, tagExp, this.options));
+        ({ tagName, tagExp } = transformTagName(options.transformTagName, tagName, tagExp, options));
 
-        if (this.options.strictReservedNames &&
-          (tagName === this.options.commentPropName
-            || tagName === this.options.cdataPropName
-            || tagName === this.options.textNodeName
-            || tagName === this.options.attributesGroupName
+        if (options.strictReservedNames &&
+          (tagName === options.commentPropName
+            || tagName === options.cdataPropName
+            || tagName === options.textNodeName
+            || tagName === options.attributesGroupName
           )) {
           throw new Error(`Invalid tag name: ${tagName}`);
         }
@@ -49687,7 +50560,7 @@ const parseXml = function (xmlData) {
 
         //check if last tag was unpaired tag
         const lastTag = currentNode;
-        if (lastTag && this.options.unpairedTags.indexOf(lastTag.tagname) !== -1) {
+        if (lastTag && options.unpairedTagsSet.has(lastTag.tagname)) {
           currentNode = this.tagsNodeStack.pop();
           this.matcher.pop();
         }
@@ -49728,13 +50601,14 @@ const parseXml = function (xmlData) {
 
           if (prefixedAttrs) {
             // Extract raw attributes (without prefix) for our use
-            extractRawAttributes(prefixedAttrs, this.options);
+            //TODO: seems a performance overhead
+            extractRawAttributes(prefixedAttrs, options);
           }
         }
 
         // Now check if this is a stop node (after attributes are set)
         if (tagName !== xmlObj.tagname) {
-          this.isCurrentNodeStopNode = this.isItStopNode(this.stopNodeExpressions, this.matcher);
+          this.isCurrentNodeStopNode = this.isItStopNode();
         }
 
         const startIndex = i;
@@ -49746,7 +50620,7 @@ const parseXml = function (xmlData) {
             i = result.closeIndex;
           }
           //unpaired tag
-          else if (this.options.unpairedTags.indexOf(tagName) !== -1) {
+          else if (options.unpairedTagsSet.has(tagName)) {
             i = result.closeIndex;
           }
           //normal tag
@@ -49765,7 +50639,7 @@ const parseXml = function (xmlData) {
           }
 
           // For stop nodes, store raw content as-is without any processing
-          childNode.add(this.options.textNodeName, tagContent);
+          childNode.add(options.textNodeName, tagContent);
 
           this.matcher.pop(); // Pop the stop node tag
           this.isCurrentNodeStopNode = false; // Reset flag
@@ -49774,7 +50648,7 @@ const parseXml = function (xmlData) {
         } else {
           //selfClosing tag
           if (isSelfClosing) {
-            ({ tagName, tagExp } = transformTagName(this.options.transformTagName, tagName, tagExp, this.options));
+            ({ tagName, tagExp } = transformTagName(options.transformTagName, tagName, tagExp, options));
 
             const childNode = new XmlNode(tagName);
             if (prefixedAttrs) {
@@ -49784,7 +50658,7 @@ const parseXml = function (xmlData) {
             this.matcher.pop(); // Pop self-closing tag
             this.isCurrentNodeStopNode = false; // Reset flag
           }
-          else if (this.options.unpairedTags.indexOf(tagName) !== -1) {//unpaired tag
+          else if (options.unpairedTagsSet.has(tagName)) {//unpaired tag
             const childNode = new XmlNode(tagName);
             if (prefixedAttrs) {
               childNode[":@"] = prefixedAttrs;
@@ -49799,7 +50673,7 @@ const parseXml = function (xmlData) {
           //opening tag
           else {
             const childNode = new XmlNode(tagName);
-            if (this.tagsNodeStack.length > this.options.maxNestedTags) {
+            if (this.tagsNodeStack.length > options.maxNestedTags) {
               throw new Error("Maximum nested tags exceeded");
             }
             this.tagsNodeStack.push(currentNode);
@@ -49868,79 +50742,7 @@ function replaceEntitiesValue$1(val, tagName, jPath) {
     }
   }
 
-  // Replace DOCTYPE entities
-  for (const entityName of Object.keys(this.docTypeEntities)) {
-    const entity = this.docTypeEntities[entityName];
-    const matches = val.match(entity.regx);
-
-    if (matches) {
-      // Track expansions
-      this.entityExpansionCount += matches.length;
-
-      // Check expansion limit
-      if (entityConfig.maxTotalExpansions &&
-        this.entityExpansionCount > entityConfig.maxTotalExpansions) {
-        throw new Error(
-          `Entity expansion limit exceeded: ${this.entityExpansionCount} > ${entityConfig.maxTotalExpansions}`
-        );
-      }
-
-      // Store length before replacement
-      const lengthBefore = val.length;
-      val = val.replace(entity.regx, entity.val);
-
-      // Check expanded length immediately after replacement
-      if (entityConfig.maxExpandedLength) {
-        this.currentExpandedLength += (val.length - lengthBefore);
-
-        if (this.currentExpandedLength > entityConfig.maxExpandedLength) {
-          throw new Error(
-            `Total expanded content size exceeded: ${this.currentExpandedLength} > ${entityConfig.maxExpandedLength}`
-          );
-        }
-      }
-    }
-  }
-  // Replace standard entities
-  for (const entityName of Object.keys(this.lastEntities)) {
-    const entity = this.lastEntities[entityName];
-    const matches = val.match(entity.regex);
-    if (matches) {
-      this.entityExpansionCount += matches.length;
-      if (entityConfig.maxTotalExpansions &&
-        this.entityExpansionCount > entityConfig.maxTotalExpansions) {
-        throw new Error(
-          `Entity expansion limit exceeded: ${this.entityExpansionCount} > ${entityConfig.maxTotalExpansions}`
-        );
-      }
-    }
-    val = val.replace(entity.regex, entity.val);
-  }
-  if (val.indexOf('&') === -1) return val;
-
-  // Replace HTML entities if enabled
-  if (this.options.htmlEntities) {
-    for (const entityName of Object.keys(this.htmlEntities)) {
-      const entity = this.htmlEntities[entityName];
-      const matches = val.match(entity.regex);
-      if (matches) {
-        //console.log(matches);
-        this.entityExpansionCount += matches.length;
-        if (entityConfig.maxTotalExpansions &&
-          this.entityExpansionCount > entityConfig.maxTotalExpansions) {
-          throw new Error(
-            `Entity expansion limit exceeded: ${this.entityExpansionCount} > ${entityConfig.maxTotalExpansions}`
-          );
-        }
-      }
-      val = val.replace(entity.regex, entity.val);
-    }
-  }
-
-  // Replace ampersand entity last
-  val = val.replace(this.ampEntity.regex, this.ampEntity.val);
-
-  return val;
+  return this.entityDecoder.decode(val);
 }
 
 
@@ -49962,20 +50764,14 @@ function saveTextToParentTag(textData, parentNode, matcher, isLeafNode) {
   return textData;
 }
 
-//TODO: use jPath to simplify the logic
 /**
  * @param {Array<Expression>} stopNodeExpressions - Array of compiled Expression objects
  * @param {Matcher} matcher - Current path matcher
  */
-function isItStopNode(stopNodeExpressions, matcher) {
-  if (!stopNodeExpressions || stopNodeExpressions.length === 0) return false;
+function isItStopNode() {
+  if (this.stopNodeExpressionsSet.size === 0) return false;
 
-  for (let i = 0; i < stopNodeExpressions.length; i++) {
-    if (matcher.matches(stopNodeExpressions[i])) {
-      return true;
-    }
-  }
-  return false;
+  return this.matcher.matchesAny(this.stopNodeExpressionsSet);
 }
 
 /**
@@ -49985,32 +50781,33 @@ function isItStopNode(stopNodeExpressions, matcher) {
  * @returns 
  */
 function tagExpWithClosingIndex(xmlData, i, closingChar = ">") {
-  let attrBoundary;
-  let tagExp = "";
-  for (let index = i; index < xmlData.length; index++) {
-    let ch = xmlData[index];
+  let attrBoundary = 0;
+  const chars = [];
+  const len = xmlData.length;
+  const closeCode0 = closingChar.charCodeAt(0);
+  const closeCode1 = closingChar.length > 1 ? closingChar.charCodeAt(1) : -1;
+
+  for (let index = i; index < len; index++) {
+    const code = xmlData.charCodeAt(index);
+
     if (attrBoundary) {
-      if (ch === attrBoundary) attrBoundary = "";//reset
-    } else if (ch === '"' || ch === "'") {
-      attrBoundary = ch;
-    } else if (ch === closingChar[0]) {
-      if (closingChar[1]) {
-        if (xmlData[index + 1] === closingChar[1]) {
-          return {
-            data: tagExp,
-            index: index
-          }
+      if (code === attrBoundary) attrBoundary = 0;
+    } else if (code === 34 || code === 39) { // " or '
+      attrBoundary = code;
+    } else if (code === closeCode0) {
+      if (closeCode1 !== -1) {
+        if (xmlData.charCodeAt(index + 1) === closeCode1) {
+          return { data: String.fromCharCode(...chars), index };
         }
       } else {
-        return {
-          data: tagExp,
-          index: index
-        }
+        return { data: String.fromCharCode(...chars), index };
       }
-    } else if (ch === '\t') {
-      ch = " ";
+    } else if (code === 9) { // \t
+      chars.push(32); // space
+      continue;
     }
-    tagExp += ch;
+
+    chars.push(code);
   }
 }
 
@@ -50021,6 +50818,12 @@ function findClosingIndex(xmlData, str, i, errMsg) {
   } else {
     return closingIndex + str.length - 1;
   }
+}
+
+function findClosingChar(xmlData, char, i, errMsg) {
+  const closingIndex = xmlData.indexOf(char, i);
+  if (closingIndex === -1) throw new Error(errMsg);
+  return closingIndex; // no offset needed
 }
 
 function readTagExp(xmlData, i, removeNSPrefix, closingChar = ">") {
@@ -50064,10 +50867,12 @@ function readStopNodeData(xmlData, tagName, i) {
   // Starting at 1 since we already have an open tag
   let openTagCount = 1;
 
-  for (; i < xmlData.length; i++) {
+  const xmllen = xmlData.length;
+  for (; i < xmllen; i++) {
     if (xmlData[i] === "<") {
-      if (xmlData[i + 1] === "/") {//close tag
-        const closeIndex = findClosingIndex(xmlData, ">", i, `${tagName} is not closed`);
+      const c1 = xmlData.charCodeAt(i + 1);
+      if (c1 === 47) {//close tag '/'
+        const closeIndex = findClosingChar(xmlData, ">", i, `${tagName} is not closed`);
         let closeTagName = xmlData.substring(i + 2, closeIndex).trim();
         if (closeTagName === tagName) {
           openTagCount--;
@@ -50079,13 +50884,16 @@ function readStopNodeData(xmlData, tagName, i) {
           }
         }
         i = closeIndex;
-      } else if (xmlData[i + 1] === '?') {
+      } else if (c1 === 63) { //?
         const closeIndex = findClosingIndex(xmlData, "?>", i + 1, "StopNode is not closed.");
         i = closeIndex;
-      } else if (xmlData.substr(i + 1, 3) === '!--') {
+      } else if (c1 === 33
+        && xmlData.charCodeAt(i + 2) === 45
+        && xmlData.charCodeAt(i + 3) === 45) { // '!--'
         const closeIndex = findClosingIndex(xmlData, "-->", i + 3, "StopNode is not closed.");
         i = closeIndex;
-      } else if (xmlData.substr(i + 1, 2) === '![') {
+      } else if (c1 === 33
+        && xmlData.charCodeAt(i + 2) === 91) { // '!['
         const closeIndex = findClosingIndex(xmlData, "]]>", i, "StopNode is not closed.") - 2;
         i = closeIndex;
       } else {
@@ -50116,16 +50924,6 @@ function parseValue(val, shouldParse, options) {
     } else {
       return '';
     }
-  }
-}
-
-function fromCodePoint(str, base, prefix) {
-  const codePoint = Number.parseInt(str, base);
-
-  if (codePoint >= 0 && codePoint <= 0x10FFFF) {
-    return String.fromCodePoint(codePoint);
-  } else {
-    return prefix + str + ";";
   }
 }
 
@@ -50349,7 +51147,7 @@ class XMLParser {
             }
         }
         const orderedObjParser = new OrderedObjParser(this.options);
-        orderedObjParser.addExternalEntities(this.externalEntities);
+        orderedObjParser.entityDecoder.setExternalEntities(this.externalEntities);
         const orderedResult = orderedObjParser.parseXml(xmlData);
         if (this.options.preserveOrder || orderedResult === undefined) return orderedResult;
         else return prettify(orderedResult, this.options, orderedObjParser.matcher, orderedObjParser.readonlyMatcher);
@@ -50469,12 +51267,18 @@ function arrToStr(arr, options, indentation, matcher, stopNodeExpressions) {
             if (isPreviousElementTag) {
                 xmlStr += indentation;
             }
-            xmlStr += `<![CDATA[${tagObj[tagName][0][options.textNodeName]}]]>`;
+            const val = tagObj[tagName][0][options.textNodeName];
+            const safeVal = String(val).replace(/\]\]>/g, ']]]]><![CDATA[>');
+            xmlStr += `<![CDATA[${safeVal}]]>`;
             isPreviousElementTag = false;
             matcher.pop();
             continue;
         } else if (tagName === options.commentPropName) {
-            xmlStr += indentation + `<!--${tagObj[tagName][0][options.textNodeName]}-->`;
+            const val = tagObj[tagName][0][options.textNodeName];
+            const safeVal = String(val)
+                .replace(/--/g, '- -')   // -- is illegal anywhere in comment content
+                .replace(/-$/, '- ');    // trailing - would form -- with the closing -->
+            xmlStr += indentation + `<!--${safeVal}-->`;
             isPreviousElementTag = true;
             matcher.pop();
             continue;
@@ -50697,7 +51501,7 @@ function getIgnoreAttributesFn(ignoreAttributes) {
     return () => false
 }
 
-const defaultOptions = {
+const defaultOptions$1 = {
   attributeNamePrefix: '@_',
   attributesGroupName: false,
   textNodeName: '#text',
@@ -50734,7 +51538,7 @@ const defaultOptions = {
 };
 
 function Builder(options) {
-  this.options = Object.assign({}, defaultOptions, options);
+  this.options = Object.assign({}, defaultOptions$1, options);
 
   // Convert old-style stopNodes for backward compatibility
   // Old syntax: "*.tag" meant "tag anywhere in tree"
@@ -51165,9 +51969,13 @@ Builder.prototype.checkStopNode = function (matcher) {
 
 Builder.prototype.buildTextValNode = function (val, key, attrStr, level, matcher) {
   if (this.options.cdataPropName !== false && key === this.options.cdataPropName) {
-    return this.indentate(level) + `<![CDATA[${val}]]>` + this.newLine;
+    const safeVal = String(val).replace(/\]\]>/g, ']]]]><![CDATA[>');
+    return this.indentate(level) + `<![CDATA[${safeVal}]]>` + this.newLine;
   } else if (this.options.commentPropName !== false && key === this.options.commentPropName) {
-    return this.indentate(level) + `<!--${val}-->` + this.newLine;
+    const safeVal = String(val)
+      .replace(/--/g, '- -')   // -- is illegal anywhere in comment content
+      .replace(/-$/, '- ');    // trailing - would form -- with the closing -->
+    return this.indentate(level) + `<!--${safeVal}-->` + this.newLine;
   } else if (key[0] === "?") {//PI tag
     return this.indentate(level) + '<' + key + attrStr + '?' + this.tagEndChar;
   } else {
@@ -118027,7 +118835,7 @@ async function uploadAttachments({ files, name, owner, repo, text, }) {
     }
     const url = `https://github.com/${owner}/${repo}/actions/runs/${context$2.runId}/artifacts/${id}`;
     const rendered = text.replaceAll('%ARTIFACT_URL%', url).replaceAll('%ATTACH_NAME%', name);
-    const markdown = `\n---\n${rendered}\n`;
+    const markdown = `\n\n---\n${rendered}\n`;
     return { url, markdown };
 }
 function commonDirectory(files) {
@@ -118207,6 +119015,7 @@ async function getInputs() {
     const refreshMessagePosition = getInput('refresh-message-position', { required: false }) === 'true';
     const updateOnly = getInput('update-only', { required: false }) === 'true';
     const preformatted = getInput('preformatted', { required: false }) === 'true';
+    const templateVariables = getInput('template-variables', { required: false }) === 'true';
     const truncateInput = getInput('truncate', { required: false }) || 'artifact';
     if (truncateInput !== 'artifact' && truncateInput !== 'simple') {
         throw new Error(`Invalid truncate mode: "${truncateInput}". Must be "artifact" or "simple".`);
@@ -118242,6 +119051,7 @@ async function getInputs() {
         messageFind,
         messageReplace,
         preformatted,
+        templateVariables,
         truncate,
         truncateSeparator: truncateSeparator || undefined,
         proxyUrl,
@@ -118518,7 +119328,7 @@ function getSearchPaths(patterns) {
 /**
  * Matches the patterns against the path
  */
-function match(patterns, itemPath) {
+function match$1(patterns, itemPath) {
     let result = MatchKind.None;
     for (const pattern of patterns) {
         if (pattern.negate) {
@@ -120194,9 +121004,9 @@ class DefaultGlobber {
                 // Pop
                 const item = stack.pop();
                 // Match?
-                const match$1 = match(patterns, item.path);
-                const partialMatch$1 = !!match$1 || partialMatch(patterns, item.path);
-                if (!match$1 && !partialMatch$1) {
+                const match = match$1(patterns, item.path);
+                const partialMatch$1 = !!match || partialMatch(patterns, item.path);
+                if (!match && !partialMatch$1) {
                     continue;
                 }
                 // Stat
@@ -120214,7 +121024,7 @@ class DefaultGlobber {
                 // Directory
                 if (stats.isDirectory()) {
                     // Matched
-                    if (match$1 & MatchKind.Directory && options.matchDirectories) {
+                    if (match & MatchKind.Directory && options.matchDirectories) {
                         yield yield __await(item.path);
                     }
                     // Descend?
@@ -120227,7 +121037,7 @@ class DefaultGlobber {
                     stack.push(...childItems.reverse());
                 }
                 // File
-                else if (match$1 & MatchKind.File) {
+                else if (match & MatchKind.File) {
                     yield yield __await(item.path);
                 }
             }
@@ -120558,9 +121368,2803 @@ async function createCommentProxy(params) {
     return response.result;
 }
 
+/**
+ * @module constants
+ * @summary Useful constants
+ * @description
+ * Collection of useful date constants.
+ *
+ * The constants could be imported from `date-fns/constants`:
+ *
+ * ```ts
+ * import { maxTime, minTime } from "./constants/date-fns/constants";
+ *
+ * function isAllowedTime(time) {
+ *   return time <= maxTime && time >= minTime;
+ * }
+ * ```
+ */
+
+
+/**
+ * @constant
+ * @name millisecondsInWeek
+ * @summary Milliseconds in 1 week.
+ */
+const millisecondsInWeek = 604800000;
+
+/**
+ * @constant
+ * @name millisecondsInDay
+ * @summary Milliseconds in 1 day.
+ */
+const millisecondsInDay = 86400000;
+
+/**
+ * @constant
+ * @name constructFromSymbol
+ * @summary Symbol enabling Date extensions to inherit properties from the reference date.
+ *
+ * The symbol is used to enable the `constructFrom` function to construct a date
+ * using a reference date and a value. It allows to transfer extra properties
+ * from the reference date to the new date. It's useful for extensions like
+ * [`TZDate`](https://github.com/date-fns/tz) that accept a time zone as
+ * a constructor argument.
+ */
+const constructFromSymbol = Symbol.for("constructDateFrom");
+
+/**
+ * @name constructFrom
+ * @category Generic Helpers
+ * @summary Constructs a date using the reference date and the value
+ *
+ * @description
+ * The function constructs a new date using the constructor from the reference
+ * date and the given value. It helps to build generic functions that accept
+ * date extensions.
+ *
+ * It defaults to `Date` if the passed reference date is a number or a string.
+ *
+ * Starting from v3.7.0, it allows to construct a date using `[Symbol.for("constructDateFrom")]`
+ * enabling to transfer extra properties from the reference date to the new date.
+ * It's useful for extensions like [`TZDate`](https://github.com/date-fns/tz)
+ * that accept a time zone as a constructor argument.
+ *
+ * @typeParam DateType - The `Date` type, the function operates on. Gets inferred from passed arguments. Allows to use extensions like [`UTCDate`](https://github.com/date-fns/utc).
+ *
+ * @param date - The reference date to take constructor from
+ * @param value - The value to create the date
+ *
+ * @returns Date initialized using the given date and value
+ *
+ * @example
+ * import { constructFrom } from "./constructFrom/date-fns";
+ *
+ * // A function that clones a date preserving the original type
+ * function cloneDate<DateType extends Date>(date: DateType): DateType {
+ *   return constructFrom(
+ *     date, // Use constructor from the given date
+ *     date.getTime() // Use the date value to create a new date
+ *   );
+ * }
+ */
+function constructFrom(date, value) {
+  if (typeof date === "function") return date(value);
+
+  if (date && typeof date === "object" && constructFromSymbol in date)
+    return date[constructFromSymbol](value);
+
+  if (date instanceof Date) return new date.constructor(value);
+
+  return new Date(value);
+}
+
+/**
+ * @name toDate
+ * @category Common Helpers
+ * @summary Convert the given argument to an instance of Date.
+ *
+ * @description
+ * Convert the given argument to an instance of Date.
+ *
+ * If the argument is an instance of Date, the function returns its clone.
+ *
+ * If the argument is a number, it is treated as a timestamp.
+ *
+ * If the argument is none of the above, the function returns Invalid Date.
+ *
+ * Starting from v3.7.0, it clones a date using `[Symbol.for("constructDateFrom")]`
+ * enabling to transfer extra properties from the reference date to the new date.
+ * It's useful for extensions like [`TZDate`](https://github.com/date-fns/tz)
+ * that accept a time zone as a constructor argument.
+ *
+ * **Note**: *all* Date arguments passed to any *date-fns* function is processed by `toDate`.
+ *
+ * @typeParam DateType - The `Date` type, the function operates on. Gets inferred from passed arguments. Allows to use extensions like [`UTCDate`](https://github.com/date-fns/utc).
+ * @typeParam ResultDate - The result `Date` type, it is the type returned from the context function if it is passed, or inferred from the arguments.
+ *
+ * @param argument - The value to convert
+ *
+ * @returns The parsed date in the local time zone
+ *
+ * @example
+ * // Clone the date:
+ * const result = toDate(new Date(2014, 1, 11, 11, 30, 30))
+ * //=> Tue Feb 11 2014 11:30:30
+ *
+ * @example
+ * // Convert the timestamp to date:
+ * const result = toDate(1392098430000)
+ * //=> Tue Feb 11 2014 11:30:30
+ */
+function toDate(argument, context) {
+  // [TODO] Get rid of `toDate` or `constructFrom`?
+  return constructFrom(context || argument, argument);
+}
+
+let defaultOptions = {};
+
+function getDefaultOptions() {
+  return defaultOptions;
+}
+
+/**
+ * The {@link startOfWeek} function options.
+ */
+
+/**
+ * @name startOfWeek
+ * @category Week Helpers
+ * @summary Return the start of a week for the given date.
+ *
+ * @description
+ * Return the start of a week for the given date.
+ * The result will be in the local timezone.
+ *
+ * @typeParam DateType - The `Date` type, the function operates on. Gets inferred from passed arguments. Allows to use extensions like [`UTCDate`](https://github.com/date-fns/utc).
+ * @typeParam ResultDate - The result `Date` type, it is the type returned from the context function if it is passed, or inferred from the arguments.
+ *
+ * @param date - The original date
+ * @param options - An object with options
+ *
+ * @returns The start of a week
+ *
+ * @example
+ * // The start of a week for 2 September 2014 11:55:00:
+ * const result = startOfWeek(new Date(2014, 8, 2, 11, 55, 0))
+ * //=> Sun Aug 31 2014 00:00:00
+ *
+ * @example
+ * // If the week starts on Monday, the start of the week for 2 September 2014 11:55:00:
+ * const result = startOfWeek(new Date(2014, 8, 2, 11, 55, 0), { weekStartsOn: 1 })
+ * //=> Mon Sep 01 2014 00:00:00
+ */
+function startOfWeek(date, options) {
+  const defaultOptions = getDefaultOptions();
+  const weekStartsOn =
+    options?.weekStartsOn ??
+    options?.locale?.options?.weekStartsOn ??
+    defaultOptions.weekStartsOn ??
+    defaultOptions.locale?.options?.weekStartsOn ??
+    0;
+
+  const _date = toDate(date, options?.in);
+  const day = _date.getDay();
+  const diff = (day < weekStartsOn ? 7 : 0) + day - weekStartsOn;
+
+  _date.setDate(_date.getDate() - diff);
+  _date.setHours(0, 0, 0, 0);
+  return _date;
+}
+
+/**
+ * The {@link startOfISOWeek} function options.
+ */
+
+/**
+ * @name startOfISOWeek
+ * @category ISO Week Helpers
+ * @summary Return the start of an ISO week for the given date.
+ *
+ * @description
+ * Return the start of an ISO week for the given date.
+ * The result will be in the local timezone.
+ *
+ * ISO week-numbering year: http://en.wikipedia.org/wiki/ISO_week_date
+ *
+ * @typeParam DateType - The `Date` type, the function operates on. Gets inferred from passed arguments. Allows to use extensions like [`UTCDate`](https://github.com/date-fns/utc).
+ * @typeParam ResultDate - The result `Date` type, it is the type returned from the context function if it is passed, or inferred from the arguments.
+ *
+ * @param date - The original date
+ * @param options - An object with options
+ *
+ * @returns The start of an ISO week
+ *
+ * @example
+ * // The start of an ISO week for 2 September 2014 11:55:00:
+ * const result = startOfISOWeek(new Date(2014, 8, 2, 11, 55, 0))
+ * //=> Mon Sep 01 2014 00:00:00
+ */
+function startOfISOWeek(date, options) {
+  return startOfWeek(date, { ...options, weekStartsOn: 1 });
+}
+
+/**
+ * The {@link getISOWeekYear} function options.
+ */
+
+/**
+ * @name getISOWeekYear
+ * @category ISO Week-Numbering Year Helpers
+ * @summary Get the ISO week-numbering year of the given date.
+ *
+ * @description
+ * Get the ISO week-numbering year of the given date,
+ * which always starts 3 days before the year's first Thursday.
+ *
+ * ISO week-numbering year: http://en.wikipedia.org/wiki/ISO_week_date
+ *
+ * @param date - The given date
+ *
+ * @returns The ISO week-numbering year
+ *
+ * @example
+ * // Which ISO-week numbering year is 2 January 2005?
+ * const result = getISOWeekYear(new Date(2005, 0, 2))
+ * //=> 2004
+ */
+function getISOWeekYear(date, options) {
+  const _date = toDate(date, options?.in);
+  const year = _date.getFullYear();
+
+  const fourthOfJanuaryOfNextYear = constructFrom(_date, 0);
+  fourthOfJanuaryOfNextYear.setFullYear(year + 1, 0, 4);
+  fourthOfJanuaryOfNextYear.setHours(0, 0, 0, 0);
+  const startOfNextYear = startOfISOWeek(fourthOfJanuaryOfNextYear);
+
+  const fourthOfJanuaryOfThisYear = constructFrom(_date, 0);
+  fourthOfJanuaryOfThisYear.setFullYear(year, 0, 4);
+  fourthOfJanuaryOfThisYear.setHours(0, 0, 0, 0);
+  const startOfThisYear = startOfISOWeek(fourthOfJanuaryOfThisYear);
+
+  if (_date.getTime() >= startOfNextYear.getTime()) {
+    return year + 1;
+  } else if (_date.getTime() >= startOfThisYear.getTime()) {
+    return year;
+  } else {
+    return year - 1;
+  }
+}
+
+/**
+ * Google Chrome as of 67.0.3396.87 introduced timezones with offset that includes seconds.
+ * They usually appear for dates that denote time before the timezones were introduced
+ * (e.g. for 'Europe/Prague' timezone the offset is GMT+00:57:44 before 1 October 1891
+ * and GMT+01:00:00 after that date)
+ *
+ * Date#getTimezoneOffset returns the offset in minutes and would return 57 for the example above,
+ * which would lead to incorrect calculations.
+ *
+ * This function returns the timezone offset in milliseconds that takes seconds in account.
+ */
+function getTimezoneOffsetInMilliseconds(date) {
+  const _date = toDate(date);
+  const utcDate = new Date(
+    Date.UTC(
+      _date.getFullYear(),
+      _date.getMonth(),
+      _date.getDate(),
+      _date.getHours(),
+      _date.getMinutes(),
+      _date.getSeconds(),
+      _date.getMilliseconds(),
+    ),
+  );
+  utcDate.setUTCFullYear(_date.getFullYear());
+  return +date - +utcDate;
+}
+
+function normalizeDates(context, ...dates) {
+  const normalize = constructFrom.bind(
+    null,
+    dates.find((date) => typeof date === "object"),
+  );
+  return dates.map(normalize);
+}
+
+/**
+ * The {@link startOfDay} function options.
+ */
+
+/**
+ * @name startOfDay
+ * @category Day Helpers
+ * @summary Return the start of a day for the given date.
+ *
+ * @description
+ * Return the start of a day for the given date.
+ * The result will be in the local timezone.
+ *
+ * @typeParam DateType - The `Date` type, the function operates on. Gets inferred from passed arguments. Allows to use extensions like [`UTCDate`](https://github.com/date-fns/utc).
+ * @typeParam ResultDate - The result `Date` type, it is the type returned from the context function if it is passed, or inferred from the arguments.
+ *
+ * @param date - The original date
+ * @param options - The options
+ *
+ * @returns The start of a day
+ *
+ * @example
+ * // The start of a day for 2 September 2014 11:55:00:
+ * const result = startOfDay(new Date(2014, 8, 2, 11, 55, 0))
+ * //=> Tue Sep 02 2014 00:00:00
+ */
+function startOfDay(date, options) {
+  const _date = toDate(date, options?.in);
+  _date.setHours(0, 0, 0, 0);
+  return _date;
+}
+
+/**
+ * The {@link differenceInCalendarDays} function options.
+ */
+
+/**
+ * @name differenceInCalendarDays
+ * @category Day Helpers
+ * @summary Get the number of calendar days between the given dates.
+ *
+ * @description
+ * Get the number of calendar days between the given dates. This means that the times are removed
+ * from the dates and then the difference in days is calculated.
+ *
+ * @param laterDate - The later date
+ * @param earlierDate - The earlier date
+ * @param options - The options object
+ *
+ * @returns The number of calendar days
+ *
+ * @example
+ * // How many calendar days are between
+ * // 2 July 2011 23:00:00 and 2 July 2012 00:00:00?
+ * const result = differenceInCalendarDays(
+ *   new Date(2012, 6, 2, 0, 0),
+ *   new Date(2011, 6, 2, 23, 0)
+ * )
+ * //=> 366
+ * // How many calendar days are between
+ * // 2 July 2011 23:59:00 and 3 July 2011 00:01:00?
+ * const result = differenceInCalendarDays(
+ *   new Date(2011, 6, 3, 0, 1),
+ *   new Date(2011, 6, 2, 23, 59)
+ * )
+ * //=> 1
+ */
+function differenceInCalendarDays(laterDate, earlierDate, options) {
+  const [laterDate_, earlierDate_] = normalizeDates(
+    options?.in,
+    laterDate,
+    earlierDate,
+  );
+
+  const laterStartOfDay = startOfDay(laterDate_);
+  const earlierStartOfDay = startOfDay(earlierDate_);
+
+  const laterTimestamp =
+    +laterStartOfDay - getTimezoneOffsetInMilliseconds(laterStartOfDay);
+  const earlierTimestamp =
+    +earlierStartOfDay - getTimezoneOffsetInMilliseconds(earlierStartOfDay);
+
+  // Round the number of days to the nearest integer because the number of
+  // milliseconds in a day is not constant (e.g. it's different in the week of
+  // the daylight saving time clock shift).
+  return Math.round((laterTimestamp - earlierTimestamp) / millisecondsInDay);
+}
+
+/**
+ * The {@link startOfISOWeekYear} function options.
+ */
+
+/**
+ * @name startOfISOWeekYear
+ * @category ISO Week-Numbering Year Helpers
+ * @summary Return the start of an ISO week-numbering year for the given date.
+ *
+ * @description
+ * Return the start of an ISO week-numbering year,
+ * which always starts 3 days before the year's first Thursday.
+ * The result will be in the local timezone.
+ *
+ * ISO week-numbering year: http://en.wikipedia.org/wiki/ISO_week_date
+ *
+ * @typeParam DateType - The `Date` type, the function operates on. Gets inferred from passed arguments. Allows to use extensions like [`UTCDate`](https://github.com/date-fns/utc).
+ * @typeParam ResultDate - The result `Date` type, it is the type returned from the context function if it is passed, or inferred from the arguments.
+ *
+ * @param date - The original date
+ * @param options - An object with options
+ *
+ * @returns The start of an ISO week-numbering year
+ *
+ * @example
+ * // The start of an ISO week-numbering year for 2 July 2005:
+ * const result = startOfISOWeekYear(new Date(2005, 6, 2))
+ * //=> Mon Jan 03 2005 00:00:00
+ */
+function startOfISOWeekYear(date, options) {
+  const year = getISOWeekYear(date, options);
+  const fourthOfJanuary = constructFrom(date, 0);
+  fourthOfJanuary.setFullYear(year, 0, 4);
+  fourthOfJanuary.setHours(0, 0, 0, 0);
+  return startOfISOWeek(fourthOfJanuary);
+}
+
+/**
+ * @name isDate
+ * @category Common Helpers
+ * @summary Is the given value a date?
+ *
+ * @description
+ * Returns true if the given value is an instance of Date. The function works for dates transferred across iframes.
+ *
+ * @param value - The value to check
+ *
+ * @returns True if the given value is a date
+ *
+ * @example
+ * // For a valid date:
+ * const result = isDate(new Date())
+ * //=> true
+ *
+ * @example
+ * // For an invalid date:
+ * const result = isDate(new Date(NaN))
+ * //=> true
+ *
+ * @example
+ * // For some value:
+ * const result = isDate('2014-02-31')
+ * //=> false
+ *
+ * @example
+ * // For an object:
+ * const result = isDate({})
+ * //=> false
+ */
+function isDate(value) {
+  return (
+    value instanceof Date ||
+    (typeof value === "object" &&
+      Object.prototype.toString.call(value) === "[object Date]")
+  );
+}
+
+/**
+ * @name isValid
+ * @category Common Helpers
+ * @summary Is the given date valid?
+ *
+ * @description
+ * Returns false if argument is Invalid Date and true otherwise.
+ * Argument is converted to Date using `toDate`. See [toDate](https://date-fns.org/docs/toDate)
+ * Invalid Date is a Date, whose time value is NaN.
+ *
+ * Time value of Date: http://es5.github.io/#x15.9.1.1
+ *
+ * @param date - The date to check
+ *
+ * @returns The date is valid
+ *
+ * @example
+ * // For the valid date:
+ * const result = isValid(new Date(2014, 1, 31))
+ * //=> true
+ *
+ * @example
+ * // For the value, convertible into a date:
+ * const result = isValid(1393804800000)
+ * //=> true
+ *
+ * @example
+ * // For the invalid date:
+ * const result = isValid(new Date(''))
+ * //=> false
+ */
+function isValid(date) {
+  return !((!isDate(date) && typeof date !== "number") || isNaN(+toDate(date)));
+}
+
+/**
+ * The {@link startOfYear} function options.
+ */
+
+/**
+ * @name startOfYear
+ * @category Year Helpers
+ * @summary Return the start of a year for the given date.
+ *
+ * @description
+ * Return the start of a year for the given date.
+ * The result will be in the local timezone.
+ *
+ * @typeParam DateType - The `Date` type, the function operates on. Gets inferred from passed arguments. Allows to use extensions like [`UTCDate`](https://github.com/date-fns/utc).
+ * @typeParam ResultDate - The result `Date` type, it is the type returned from the context function if it is passed, or inferred from the arguments.
+ *
+ * @param date - The original date
+ * @param options - The options
+ *
+ * @returns The start of a year
+ *
+ * @example
+ * // The start of a year for 2 September 2014 11:55:00:
+ * const result = startOfYear(new Date(2014, 8, 2, 11, 55, 00))
+ * //=> Wed Jan 01 2014 00:00:00
+ */
+function startOfYear(date, options) {
+  const date_ = toDate(date, options?.in);
+  date_.setFullYear(date_.getFullYear(), 0, 1);
+  date_.setHours(0, 0, 0, 0);
+  return date_;
+}
+
+const formatDistanceLocale = {
+  lessThanXSeconds: {
+    one: "less than a second",
+    other: "less than {{count}} seconds",
+  },
+
+  xSeconds: {
+    one: "1 second",
+    other: "{{count}} seconds",
+  },
+
+  halfAMinute: "half a minute",
+
+  lessThanXMinutes: {
+    one: "less than a minute",
+    other: "less than {{count}} minutes",
+  },
+
+  xMinutes: {
+    one: "1 minute",
+    other: "{{count}} minutes",
+  },
+
+  aboutXHours: {
+    one: "about 1 hour",
+    other: "about {{count}} hours",
+  },
+
+  xHours: {
+    one: "1 hour",
+    other: "{{count}} hours",
+  },
+
+  xDays: {
+    one: "1 day",
+    other: "{{count}} days",
+  },
+
+  aboutXWeeks: {
+    one: "about 1 week",
+    other: "about {{count}} weeks",
+  },
+
+  xWeeks: {
+    one: "1 week",
+    other: "{{count}} weeks",
+  },
+
+  aboutXMonths: {
+    one: "about 1 month",
+    other: "about {{count}} months",
+  },
+
+  xMonths: {
+    one: "1 month",
+    other: "{{count}} months",
+  },
+
+  aboutXYears: {
+    one: "about 1 year",
+    other: "about {{count}} years",
+  },
+
+  xYears: {
+    one: "1 year",
+    other: "{{count}} years",
+  },
+
+  overXYears: {
+    one: "over 1 year",
+    other: "over {{count}} years",
+  },
+
+  almostXYears: {
+    one: "almost 1 year",
+    other: "almost {{count}} years",
+  },
+};
+
+const formatDistance = (token, count, options) => {
+  let result;
+
+  const tokenValue = formatDistanceLocale[token];
+  if (typeof tokenValue === "string") {
+    result = tokenValue;
+  } else if (count === 1) {
+    result = tokenValue.one;
+  } else {
+    result = tokenValue.other.replace("{{count}}", count.toString());
+  }
+
+  if (options?.addSuffix) {
+    if (options.comparison && options.comparison > 0) {
+      return "in " + result;
+    } else {
+      return result + " ago";
+    }
+  }
+
+  return result;
+};
+
+function buildFormatLongFn(args) {
+  return (options = {}) => {
+    // TODO: Remove String()
+    const width = options.width ? String(options.width) : args.defaultWidth;
+    const format = args.formats[width] || args.formats[args.defaultWidth];
+    return format;
+  };
+}
+
+const dateFormats = {
+  full: "EEEE, MMMM do, y",
+  long: "MMMM do, y",
+  medium: "MMM d, y",
+  short: "MM/dd/yyyy",
+};
+
+const timeFormats = {
+  full: "h:mm:ss a zzzz",
+  long: "h:mm:ss a z",
+  medium: "h:mm:ss a",
+  short: "h:mm a",
+};
+
+const dateTimeFormats = {
+  full: "{{date}} 'at' {{time}}",
+  long: "{{date}} 'at' {{time}}",
+  medium: "{{date}}, {{time}}",
+  short: "{{date}}, {{time}}",
+};
+
+const formatLong = {
+  date: buildFormatLongFn({
+    formats: dateFormats,
+    defaultWidth: "full",
+  }),
+
+  time: buildFormatLongFn({
+    formats: timeFormats,
+    defaultWidth: "full",
+  }),
+
+  dateTime: buildFormatLongFn({
+    formats: dateTimeFormats,
+    defaultWidth: "full",
+  }),
+};
+
+const formatRelativeLocale = {
+  lastWeek: "'last' eeee 'at' p",
+  yesterday: "'yesterday at' p",
+  today: "'today at' p",
+  tomorrow: "'tomorrow at' p",
+  nextWeek: "eeee 'at' p",
+  other: "P",
+};
+
+const formatRelative = (token, _date, _baseDate, _options) =>
+  formatRelativeLocale[token];
+
+/**
+ * The localize function argument callback which allows to convert raw value to
+ * the actual type.
+ *
+ * @param value - The value to convert
+ *
+ * @returns The converted value
+ */
+
+/**
+ * The map of localized values for each width.
+ */
+
+/**
+ * The index type of the locale unit value. It types conversion of units of
+ * values that don't start at 0 (i.e. quarters).
+ */
+
+/**
+ * Converts the unit value to the tuple of values.
+ */
+
+/**
+ * The tuple of localized era values. The first element represents BC,
+ * the second element represents AD.
+ */
+
+/**
+ * The tuple of localized quarter values. The first element represents Q1.
+ */
+
+/**
+ * The tuple of localized day values. The first element represents Sunday.
+ */
+
+/**
+ * The tuple of localized month values. The first element represents January.
+ */
+
+function buildLocalizeFn(args) {
+  return (value, options) => {
+    const context = options?.context ? String(options.context) : "standalone";
+
+    let valuesArray;
+    if (context === "formatting" && args.formattingValues) {
+      const defaultWidth = args.defaultFormattingWidth || args.defaultWidth;
+      const width = options?.width ? String(options.width) : defaultWidth;
+
+      valuesArray =
+        args.formattingValues[width] || args.formattingValues[defaultWidth];
+    } else {
+      const defaultWidth = args.defaultWidth;
+      const width = options?.width ? String(options.width) : args.defaultWidth;
+
+      valuesArray = args.values[width] || args.values[defaultWidth];
+    }
+    const index = args.argumentCallback ? args.argumentCallback(value) : value;
+
+    // @ts-expect-error - For some reason TypeScript just don't want to match it, no matter how hard we try. I challenge you to try to remove it!
+    return valuesArray[index];
+  };
+}
+
+const eraValues = {
+  narrow: ["B", "A"],
+  abbreviated: ["BC", "AD"],
+  wide: ["Before Christ", "Anno Domini"],
+};
+
+const quarterValues = {
+  narrow: ["1", "2", "3", "4"],
+  abbreviated: ["Q1", "Q2", "Q3", "Q4"],
+  wide: ["1st quarter", "2nd quarter", "3rd quarter", "4th quarter"],
+};
+
+// Note: in English, the names of days of the week and months are capitalized.
+// If you are making a new locale based on this one, check if the same is true for the language you're working on.
+// Generally, formatted dates should look like they are in the middle of a sentence,
+// e.g. in Spanish language the weekdays and months should be in the lowercase.
+const monthValues = {
+  narrow: ["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"],
+  abbreviated: [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ],
+
+  wide: [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+  ],
+};
+
+const dayValues = {
+  narrow: ["S", "M", "T", "W", "T", "F", "S"],
+  short: ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"],
+  abbreviated: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
+  wide: [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+  ],
+};
+
+const dayPeriodValues = {
+  narrow: {
+    am: "a",
+    pm: "p",
+    midnight: "mi",
+    noon: "n",
+    morning: "morning",
+    afternoon: "afternoon",
+    evening: "evening",
+    night: "night",
+  },
+  abbreviated: {
+    am: "AM",
+    pm: "PM",
+    midnight: "midnight",
+    noon: "noon",
+    morning: "morning",
+    afternoon: "afternoon",
+    evening: "evening",
+    night: "night",
+  },
+  wide: {
+    am: "a.m.",
+    pm: "p.m.",
+    midnight: "midnight",
+    noon: "noon",
+    morning: "morning",
+    afternoon: "afternoon",
+    evening: "evening",
+    night: "night",
+  },
+};
+
+const formattingDayPeriodValues = {
+  narrow: {
+    am: "a",
+    pm: "p",
+    midnight: "mi",
+    noon: "n",
+    morning: "in the morning",
+    afternoon: "in the afternoon",
+    evening: "in the evening",
+    night: "at night",
+  },
+  abbreviated: {
+    am: "AM",
+    pm: "PM",
+    midnight: "midnight",
+    noon: "noon",
+    morning: "in the morning",
+    afternoon: "in the afternoon",
+    evening: "in the evening",
+    night: "at night",
+  },
+  wide: {
+    am: "a.m.",
+    pm: "p.m.",
+    midnight: "midnight",
+    noon: "noon",
+    morning: "in the morning",
+    afternoon: "in the afternoon",
+    evening: "in the evening",
+    night: "at night",
+  },
+};
+
+const ordinalNumber = (dirtyNumber, _options) => {
+  const number = Number(dirtyNumber);
+
+  // If ordinal numbers depend on context, for example,
+  // if they are different for different grammatical genders,
+  // use `options.unit`.
+  //
+  // `unit` can be 'year', 'quarter', 'month', 'week', 'date', 'dayOfYear',
+  // 'day', 'hour', 'minute', 'second'.
+
+  const rem100 = number % 100;
+  if (rem100 > 20 || rem100 < 10) {
+    switch (rem100 % 10) {
+      case 1:
+        return number + "st";
+      case 2:
+        return number + "nd";
+      case 3:
+        return number + "rd";
+    }
+  }
+  return number + "th";
+};
+
+const localize = {
+  ordinalNumber,
+
+  era: buildLocalizeFn({
+    values: eraValues,
+    defaultWidth: "wide",
+  }),
+
+  quarter: buildLocalizeFn({
+    values: quarterValues,
+    defaultWidth: "wide",
+    argumentCallback: (quarter) => quarter - 1,
+  }),
+
+  month: buildLocalizeFn({
+    values: monthValues,
+    defaultWidth: "wide",
+  }),
+
+  day: buildLocalizeFn({
+    values: dayValues,
+    defaultWidth: "wide",
+  }),
+
+  dayPeriod: buildLocalizeFn({
+    values: dayPeriodValues,
+    defaultWidth: "wide",
+    formattingValues: formattingDayPeriodValues,
+    defaultFormattingWidth: "wide",
+  }),
+};
+
+function buildMatchFn(args) {
+  return (string, options = {}) => {
+    const width = options.width;
+
+    const matchPattern =
+      (width && args.matchPatterns[width]) ||
+      args.matchPatterns[args.defaultMatchWidth];
+    const matchResult = string.match(matchPattern);
+
+    if (!matchResult) {
+      return null;
+    }
+    const matchedString = matchResult[0];
+
+    const parsePatterns =
+      (width && args.parsePatterns[width]) ||
+      args.parsePatterns[args.defaultParseWidth];
+
+    const key = Array.isArray(parsePatterns)
+      ? findIndex(parsePatterns, (pattern) => pattern.test(matchedString))
+      : // [TODO] -- I challenge you to fix the type
+        findKey(parsePatterns, (pattern) => pattern.test(matchedString));
+
+    let value;
+
+    value = args.valueCallback ? args.valueCallback(key) : key;
+    value = options.valueCallback
+      ? // [TODO] -- I challenge you to fix the type
+        options.valueCallback(value)
+      : value;
+
+    const rest = string.slice(matchedString.length);
+
+    return { value, rest };
+  };
+}
+
+function findKey(object, predicate) {
+  for (const key in object) {
+    if (
+      Object.prototype.hasOwnProperty.call(object, key) &&
+      predicate(object[key])
+    ) {
+      return key;
+    }
+  }
+  return undefined;
+}
+
+function findIndex(array, predicate) {
+  for (let key = 0; key < array.length; key++) {
+    if (predicate(array[key])) {
+      return key;
+    }
+  }
+  return undefined;
+}
+
+function buildMatchPatternFn(args) {
+  return (string, options = {}) => {
+    const matchResult = string.match(args.matchPattern);
+    if (!matchResult) return null;
+    const matchedString = matchResult[0];
+
+    const parseResult = string.match(args.parsePattern);
+    if (!parseResult) return null;
+    let value = args.valueCallback
+      ? args.valueCallback(parseResult[0])
+      : parseResult[0];
+
+    // [TODO] I challenge you to fix the type
+    value = options.valueCallback ? options.valueCallback(value) : value;
+
+    const rest = string.slice(matchedString.length);
+
+    return { value, rest };
+  };
+}
+
+const matchOrdinalNumberPattern = /^(\d+)(th|st|nd|rd)?/i;
+const parseOrdinalNumberPattern = /\d+/i;
+
+const matchEraPatterns = {
+  narrow: /^(b|a)/i,
+  abbreviated: /^(b\.?\s?c\.?|b\.?\s?c\.?\s?e\.?|a\.?\s?d\.?|c\.?\s?e\.?)/i,
+  wide: /^(before christ|before common era|anno domini|common era)/i,
+};
+const parseEraPatterns = {
+  any: [/^b/i, /^(a|c)/i],
+};
+
+const matchQuarterPatterns = {
+  narrow: /^[1234]/i,
+  abbreviated: /^q[1234]/i,
+  wide: /^[1234](th|st|nd|rd)? quarter/i,
+};
+const parseQuarterPatterns = {
+  any: [/1/i, /2/i, /3/i, /4/i],
+};
+
+const matchMonthPatterns = {
+  narrow: /^[jfmasond]/i,
+  abbreviated: /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i,
+  wide: /^(january|february|march|april|may|june|july|august|september|october|november|december)/i,
+};
+const parseMonthPatterns = {
+  narrow: [
+    /^j/i,
+    /^f/i,
+    /^m/i,
+    /^a/i,
+    /^m/i,
+    /^j/i,
+    /^j/i,
+    /^a/i,
+    /^s/i,
+    /^o/i,
+    /^n/i,
+    /^d/i,
+  ],
+
+  any: [
+    /^ja/i,
+    /^f/i,
+    /^mar/i,
+    /^ap/i,
+    /^may/i,
+    /^jun/i,
+    /^jul/i,
+    /^au/i,
+    /^s/i,
+    /^o/i,
+    /^n/i,
+    /^d/i,
+  ],
+};
+
+const matchDayPatterns = {
+  narrow: /^[smtwf]/i,
+  short: /^(su|mo|tu|we|th|fr|sa)/i,
+  abbreviated: /^(sun|mon|tue|wed|thu|fri|sat)/i,
+  wide: /^(sunday|monday|tuesday|wednesday|thursday|friday|saturday)/i,
+};
+const parseDayPatterns = {
+  narrow: [/^s/i, /^m/i, /^t/i, /^w/i, /^t/i, /^f/i, /^s/i],
+  any: [/^su/i, /^m/i, /^tu/i, /^w/i, /^th/i, /^f/i, /^sa/i],
+};
+
+const matchDayPeriodPatterns = {
+  narrow: /^(a|p|mi|n|(in the|at) (morning|afternoon|evening|night))/i,
+  any: /^([ap]\.?\s?m\.?|midnight|noon|(in the|at) (morning|afternoon|evening|night))/i,
+};
+const parseDayPeriodPatterns = {
+  any: {
+    am: /^a/i,
+    pm: /^p/i,
+    midnight: /^mi/i,
+    noon: /^no/i,
+    morning: /morning/i,
+    afternoon: /afternoon/i,
+    evening: /evening/i,
+    night: /night/i,
+  },
+};
+
+const match = {
+  ordinalNumber: buildMatchPatternFn({
+    matchPattern: matchOrdinalNumberPattern,
+    parsePattern: parseOrdinalNumberPattern,
+    valueCallback: (value) => parseInt(value, 10),
+  }),
+
+  era: buildMatchFn({
+    matchPatterns: matchEraPatterns,
+    defaultMatchWidth: "wide",
+    parsePatterns: parseEraPatterns,
+    defaultParseWidth: "any",
+  }),
+
+  quarter: buildMatchFn({
+    matchPatterns: matchQuarterPatterns,
+    defaultMatchWidth: "wide",
+    parsePatterns: parseQuarterPatterns,
+    defaultParseWidth: "any",
+    valueCallback: (index) => index + 1,
+  }),
+
+  month: buildMatchFn({
+    matchPatterns: matchMonthPatterns,
+    defaultMatchWidth: "wide",
+    parsePatterns: parseMonthPatterns,
+    defaultParseWidth: "any",
+  }),
+
+  day: buildMatchFn({
+    matchPatterns: matchDayPatterns,
+    defaultMatchWidth: "wide",
+    parsePatterns: parseDayPatterns,
+    defaultParseWidth: "any",
+  }),
+
+  dayPeriod: buildMatchFn({
+    matchPatterns: matchDayPeriodPatterns,
+    defaultMatchWidth: "any",
+    parsePatterns: parseDayPeriodPatterns,
+    defaultParseWidth: "any",
+  }),
+};
+
+/**
+ * @category Locales
+ * @summary English locale (United States).
+ * @language English
+ * @iso-639-2 eng
+ * @author Sasha Koss [@kossnocorp](https://github.com/kossnocorp)
+ * @author Lesha Koss [@leshakoss](https://github.com/leshakoss)
+ */
+const enUS = {
+  code: "en-US",
+  formatDistance: formatDistance,
+  formatLong: formatLong,
+  formatRelative: formatRelative,
+  localize: localize,
+  match: match,
+  options: {
+    weekStartsOn: 0 /* Sunday */,
+    firstWeekContainsDate: 1,
+  },
+};
+
+/**
+ * The {@link getDayOfYear} function options.
+ */
+
+/**
+ * @name getDayOfYear
+ * @category Day Helpers
+ * @summary Get the day of the year of the given date.
+ *
+ * @description
+ * Get the day of the year of the given date.
+ *
+ * @param date - The given date
+ * @param options - The options
+ *
+ * @returns The day of year
+ *
+ * @example
+ * // Which day of the year is 2 July 2014?
+ * const result = getDayOfYear(new Date(2014, 6, 2))
+ * //=> 183
+ */
+function getDayOfYear(date, options) {
+  const _date = toDate(date, options?.in);
+  const diff = differenceInCalendarDays(_date, startOfYear(_date));
+  const dayOfYear = diff + 1;
+  return dayOfYear;
+}
+
+/**
+ * The {@link getISOWeek} function options.
+ */
+
+/**
+ * @name getISOWeek
+ * @category ISO Week Helpers
+ * @summary Get the ISO week of the given date.
+ *
+ * @description
+ * Get the ISO week of the given date.
+ *
+ * ISO week-numbering year: http://en.wikipedia.org/wiki/ISO_week_date
+ *
+ * @param date - The given date
+ * @param options - The options
+ *
+ * @returns The ISO week
+ *
+ * @example
+ * // Which week of the ISO-week numbering year is 2 January 2005?
+ * const result = getISOWeek(new Date(2005, 0, 2))
+ * //=> 53
+ */
+function getISOWeek(date, options) {
+  const _date = toDate(date, options?.in);
+  const diff = +startOfISOWeek(_date) - +startOfISOWeekYear(_date);
+
+  // Round the number of weeks to the nearest integer because the number of
+  // milliseconds in a week is not constant (e.g. it's different in the week of
+  // the daylight saving time clock shift).
+  return Math.round(diff / millisecondsInWeek) + 1;
+}
+
+/**
+ * The {@link getWeekYear} function options.
+ */
+
+/**
+ * @name getWeekYear
+ * @category Week-Numbering Year Helpers
+ * @summary Get the local week-numbering year of the given date.
+ *
+ * @description
+ * Get the local week-numbering year of the given date.
+ * The exact calculation depends on the values of
+ * `options.weekStartsOn` (which is the index of the first day of the week)
+ * and `options.firstWeekContainsDate` (which is the day of January, which is always in
+ * the first week of the week-numbering year)
+ *
+ * Week numbering: https://en.wikipedia.org/wiki/Week#The_ISO_week_date_system
+ *
+ * @param date - The given date
+ * @param options - An object with options.
+ *
+ * @returns The local week-numbering year
+ *
+ * @example
+ * // Which week numbering year is 26 December 2004 with the default settings?
+ * const result = getWeekYear(new Date(2004, 11, 26))
+ * //=> 2005
+ *
+ * @example
+ * // Which week numbering year is 26 December 2004 if week starts on Saturday?
+ * const result = getWeekYear(new Date(2004, 11, 26), { weekStartsOn: 6 })
+ * //=> 2004
+ *
+ * @example
+ * // Which week numbering year is 26 December 2004 if the first week contains 4 January?
+ * const result = getWeekYear(new Date(2004, 11, 26), { firstWeekContainsDate: 4 })
+ * //=> 2004
+ */
+function getWeekYear(date, options) {
+  const _date = toDate(date, options?.in);
+  const year = _date.getFullYear();
+
+  const defaultOptions = getDefaultOptions();
+  const firstWeekContainsDate =
+    options?.firstWeekContainsDate ??
+    options?.locale?.options?.firstWeekContainsDate ??
+    defaultOptions.firstWeekContainsDate ??
+    defaultOptions.locale?.options?.firstWeekContainsDate ??
+    1;
+
+  const firstWeekOfNextYear = constructFrom(options?.in || date, 0);
+  firstWeekOfNextYear.setFullYear(year + 1, 0, firstWeekContainsDate);
+  firstWeekOfNextYear.setHours(0, 0, 0, 0);
+  const startOfNextYear = startOfWeek(firstWeekOfNextYear, options);
+
+  const firstWeekOfThisYear = constructFrom(options?.in || date, 0);
+  firstWeekOfThisYear.setFullYear(year, 0, firstWeekContainsDate);
+  firstWeekOfThisYear.setHours(0, 0, 0, 0);
+  const startOfThisYear = startOfWeek(firstWeekOfThisYear, options);
+
+  if (+_date >= +startOfNextYear) {
+    return year + 1;
+  } else if (+_date >= +startOfThisYear) {
+    return year;
+  } else {
+    return year - 1;
+  }
+}
+
+/**
+ * The {@link startOfWeekYear} function options.
+ */
+
+/**
+ * @name startOfWeekYear
+ * @category Week-Numbering Year Helpers
+ * @summary Return the start of a local week-numbering year for the given date.
+ *
+ * @description
+ * Return the start of a local week-numbering year.
+ * The exact calculation depends on the values of
+ * `options.weekStartsOn` (which is the index of the first day of the week)
+ * and `options.firstWeekContainsDate` (which is the day of January, which is always in
+ * the first week of the week-numbering year)
+ *
+ * Week numbering: https://en.wikipedia.org/wiki/Week#The_ISO_week_date_system
+ *
+ * @typeParam DateType - The `Date` type, the function operates on. Gets inferred from passed arguments. Allows to use extensions like [`UTCDate`](https://github.com/date-fns/utc).
+ * @typeParam ResultDate - The result `Date` type.
+ *
+ * @param date - The original date
+ * @param options - An object with options
+ *
+ * @returns The start of a week-numbering year
+ *
+ * @example
+ * // The start of an a week-numbering year for 2 July 2005 with default settings:
+ * const result = startOfWeekYear(new Date(2005, 6, 2))
+ * //=> Sun Dec 26 2004 00:00:00
+ *
+ * @example
+ * // The start of a week-numbering year for 2 July 2005
+ * // if Monday is the first day of week
+ * // and 4 January is always in the first week of the year:
+ * const result = startOfWeekYear(new Date(2005, 6, 2), {
+ *   weekStartsOn: 1,
+ *   firstWeekContainsDate: 4
+ * })
+ * //=> Mon Jan 03 2005 00:00:00
+ */
+function startOfWeekYear(date, options) {
+  const defaultOptions = getDefaultOptions();
+  const firstWeekContainsDate =
+    options?.firstWeekContainsDate ??
+    options?.locale?.options?.firstWeekContainsDate ??
+    defaultOptions.firstWeekContainsDate ??
+    defaultOptions.locale?.options?.firstWeekContainsDate ??
+    1;
+
+  const year = getWeekYear(date, options);
+  const firstWeek = constructFrom(options?.in || date, 0);
+  firstWeek.setFullYear(year, 0, firstWeekContainsDate);
+  firstWeek.setHours(0, 0, 0, 0);
+  const _date = startOfWeek(firstWeek, options);
+  return _date;
+}
+
+/**
+ * The {@link getWeek} function options.
+ */
+
+/**
+ * @name getWeek
+ * @category Week Helpers
+ * @summary Get the local week index of the given date.
+ *
+ * @description
+ * Get the local week index of the given date.
+ * The exact calculation depends on the values of
+ * `options.weekStartsOn` (which is the index of the first day of the week)
+ * and `options.firstWeekContainsDate` (which is the day of January, which is always in
+ * the first week of the week-numbering year)
+ *
+ * Week numbering: https://en.wikipedia.org/wiki/Week#The_ISO_week_date_system
+ *
+ * @param date - The given date
+ * @param options - An object with options
+ *
+ * @returns The week
+ *
+ * @example
+ * // Which week of the local week numbering year is 2 January 2005 with default options?
+ * const result = getWeek(new Date(2005, 0, 2))
+ * //=> 2
+ *
+ * @example
+ * // Which week of the local week numbering year is 2 January 2005,
+ * // if Monday is the first day of the week,
+ * // and the first week of the year always contains 4 January?
+ * const result = getWeek(new Date(2005, 0, 2), {
+ *   weekStartsOn: 1,
+ *   firstWeekContainsDate: 4
+ * })
+ * //=> 53
+ */
+function getWeek(date, options) {
+  const _date = toDate(date, options?.in);
+  const diff = +startOfWeek(_date, options) - +startOfWeekYear(_date, options);
+
+  // Round the number of weeks to the nearest integer because the number of
+  // milliseconds in a week is not constant (e.g. it's different in the week of
+  // the daylight saving time clock shift).
+  return Math.round(diff / millisecondsInWeek) + 1;
+}
+
+function addLeadingZeros(number, targetLength) {
+  const sign = number < 0 ? "-" : "";
+  const output = Math.abs(number).toString().padStart(targetLength, "0");
+  return sign + output;
+}
+
+/*
+ * |     | Unit                           |     | Unit                           |
+ * |-----|--------------------------------|-----|--------------------------------|
+ * |  a  | AM, PM                         |  A* |                                |
+ * |  d  | Day of month                   |  D  |                                |
+ * |  h  | Hour [1-12]                    |  H  | Hour [0-23]                    |
+ * |  m  | Minute                         |  M  | Month                          |
+ * |  s  | Second                         |  S  | Fraction of second             |
+ * |  y  | Year (abs)                     |  Y  |                                |
+ *
+ * Letters marked by * are not implemented but reserved by Unicode standard.
+ */
+
+const lightFormatters = {
+  // Year
+  y(date, token) {
+    // From http://www.unicode.org/reports/tr35/tr35-31/tr35-dates.html#Date_Format_tokens
+    // | Year     |     y | yy |   yyy |  yyyy | yyyyy |
+    // |----------|-------|----|-------|-------|-------|
+    // | AD 1     |     1 | 01 |   001 |  0001 | 00001 |
+    // | AD 12    |    12 | 12 |   012 |  0012 | 00012 |
+    // | AD 123   |   123 | 23 |   123 |  0123 | 00123 |
+    // | AD 1234  |  1234 | 34 |  1234 |  1234 | 01234 |
+    // | AD 12345 | 12345 | 45 | 12345 | 12345 | 12345 |
+
+    const signedYear = date.getFullYear();
+    // Returns 1 for 1 BC (which is year 0 in JavaScript)
+    const year = signedYear > 0 ? signedYear : 1 - signedYear;
+    return addLeadingZeros(token === "yy" ? year % 100 : year, token.length);
+  },
+
+  // Month
+  M(date, token) {
+    const month = date.getMonth();
+    return token === "M" ? String(month + 1) : addLeadingZeros(month + 1, 2);
+  },
+
+  // Day of the month
+  d(date, token) {
+    return addLeadingZeros(date.getDate(), token.length);
+  },
+
+  // AM or PM
+  a(date, token) {
+    const dayPeriodEnumValue = date.getHours() / 12 >= 1 ? "pm" : "am";
+
+    switch (token) {
+      case "a":
+      case "aa":
+        return dayPeriodEnumValue.toUpperCase();
+      case "aaa":
+        return dayPeriodEnumValue;
+      case "aaaaa":
+        return dayPeriodEnumValue[0];
+      case "aaaa":
+      default:
+        return dayPeriodEnumValue === "am" ? "a.m." : "p.m.";
+    }
+  },
+
+  // Hour [1-12]
+  h(date, token) {
+    return addLeadingZeros(date.getHours() % 12 || 12, token.length);
+  },
+
+  // Hour [0-23]
+  H(date, token) {
+    return addLeadingZeros(date.getHours(), token.length);
+  },
+
+  // Minute
+  m(date, token) {
+    return addLeadingZeros(date.getMinutes(), token.length);
+  },
+
+  // Second
+  s(date, token) {
+    return addLeadingZeros(date.getSeconds(), token.length);
+  },
+
+  // Fraction of second
+  S(date, token) {
+    const numberOfDigits = token.length;
+    const milliseconds = date.getMilliseconds();
+    const fractionalSeconds = Math.trunc(
+      milliseconds * Math.pow(10, numberOfDigits - 3),
+    );
+    return addLeadingZeros(fractionalSeconds, token.length);
+  },
+};
+
+const dayPeriodEnum = {
+  midnight: "midnight",
+  noon: "noon",
+  morning: "morning",
+  afternoon: "afternoon",
+  evening: "evening",
+  night: "night",
+};
+
+/*
+ * |     | Unit                           |     | Unit                           |
+ * |-----|--------------------------------|-----|--------------------------------|
+ * |  a  | AM, PM                         |  A* | Milliseconds in day            |
+ * |  b  | AM, PM, noon, midnight         |  B  | Flexible day period            |
+ * |  c  | Stand-alone local day of week  |  C* | Localized hour w/ day period   |
+ * |  d  | Day of month                   |  D  | Day of year                    |
+ * |  e  | Local day of week              |  E  | Day of week                    |
+ * |  f  |                                |  F* | Day of week in month           |
+ * |  g* | Modified Julian day            |  G  | Era                            |
+ * |  h  | Hour [1-12]                    |  H  | Hour [0-23]                    |
+ * |  i! | ISO day of week                |  I! | ISO week of year               |
+ * |  j* | Localized hour w/ day period   |  J* | Localized hour w/o day period  |
+ * |  k  | Hour [1-24]                    |  K  | Hour [0-11]                    |
+ * |  l* | (deprecated)                   |  L  | Stand-alone month              |
+ * |  m  | Minute                         |  M  | Month                          |
+ * |  n  |                                |  N  |                                |
+ * |  o! | Ordinal number modifier        |  O  | Timezone (GMT)                 |
+ * |  p! | Long localized time            |  P! | Long localized date            |
+ * |  q  | Stand-alone quarter            |  Q  | Quarter                        |
+ * |  r* | Related Gregorian year         |  R! | ISO week-numbering year        |
+ * |  s  | Second                         |  S  | Fraction of second             |
+ * |  t! | Seconds timestamp              |  T! | Milliseconds timestamp         |
+ * |  u  | Extended year                  |  U* | Cyclic year                    |
+ * |  v* | Timezone (generic non-locat.)  |  V* | Timezone (location)            |
+ * |  w  | Local week of year             |  W* | Week of month                  |
+ * |  x  | Timezone (ISO-8601 w/o Z)      |  X  | Timezone (ISO-8601)            |
+ * |  y  | Year (abs)                     |  Y  | Local week-numbering year      |
+ * |  z  | Timezone (specific non-locat.) |  Z* | Timezone (aliases)             |
+ *
+ * Letters marked by * are not implemented but reserved by Unicode standard.
+ *
+ * Letters marked by ! are non-standard, but implemented by date-fns:
+ * - `o` modifies the previous token to turn it into an ordinal (see `format` docs)
+ * - `i` is ISO day of week. For `i` and `ii` is returns numeric ISO week days,
+ *   i.e. 7 for Sunday, 1 for Monday, etc.
+ * - `I` is ISO week of year, as opposed to `w` which is local week of year.
+ * - `R` is ISO week-numbering year, as opposed to `Y` which is local week-numbering year.
+ *   `R` is supposed to be used in conjunction with `I` and `i`
+ *   for universal ISO week-numbering date, whereas
+ *   `Y` is supposed to be used in conjunction with `w` and `e`
+ *   for week-numbering date specific to the locale.
+ * - `P` is long localized date format
+ * - `p` is long localized time format
+ */
+
+const formatters = {
+  // Era
+  G: function (date, token, localize) {
+    const era = date.getFullYear() > 0 ? 1 : 0;
+    switch (token) {
+      // AD, BC
+      case "G":
+      case "GG":
+      case "GGG":
+        return localize.era(era, { width: "abbreviated" });
+      // A, B
+      case "GGGGG":
+        return localize.era(era, { width: "narrow" });
+      // Anno Domini, Before Christ
+      case "GGGG":
+      default:
+        return localize.era(era, { width: "wide" });
+    }
+  },
+
+  // Year
+  y: function (date, token, localize) {
+    // Ordinal number
+    if (token === "yo") {
+      const signedYear = date.getFullYear();
+      // Returns 1 for 1 BC (which is year 0 in JavaScript)
+      const year = signedYear > 0 ? signedYear : 1 - signedYear;
+      return localize.ordinalNumber(year, { unit: "year" });
+    }
+
+    return lightFormatters.y(date, token);
+  },
+
+  // Local week-numbering year
+  Y: function (date, token, localize, options) {
+    const signedWeekYear = getWeekYear(date, options);
+    // Returns 1 for 1 BC (which is year 0 in JavaScript)
+    const weekYear = signedWeekYear > 0 ? signedWeekYear : 1 - signedWeekYear;
+
+    // Two digit year
+    if (token === "YY") {
+      const twoDigitYear = weekYear % 100;
+      return addLeadingZeros(twoDigitYear, 2);
+    }
+
+    // Ordinal number
+    if (token === "Yo") {
+      return localize.ordinalNumber(weekYear, { unit: "year" });
+    }
+
+    // Padding
+    return addLeadingZeros(weekYear, token.length);
+  },
+
+  // ISO week-numbering year
+  R: function (date, token) {
+    const isoWeekYear = getISOWeekYear(date);
+
+    // Padding
+    return addLeadingZeros(isoWeekYear, token.length);
+  },
+
+  // Extended year. This is a single number designating the year of this calendar system.
+  // The main difference between `y` and `u` localizers are B.C. years:
+  // | Year | `y` | `u` |
+  // |------|-----|-----|
+  // | AC 1 |   1 |   1 |
+  // | BC 1 |   1 |   0 |
+  // | BC 2 |   2 |  -1 |
+  // Also `yy` always returns the last two digits of a year,
+  // while `uu` pads single digit years to 2 characters and returns other years unchanged.
+  u: function (date, token) {
+    const year = date.getFullYear();
+    return addLeadingZeros(year, token.length);
+  },
+
+  // Quarter
+  Q: function (date, token, localize) {
+    const quarter = Math.ceil((date.getMonth() + 1) / 3);
+    switch (token) {
+      // 1, 2, 3, 4
+      case "Q":
+        return String(quarter);
+      // 01, 02, 03, 04
+      case "QQ":
+        return addLeadingZeros(quarter, 2);
+      // 1st, 2nd, 3rd, 4th
+      case "Qo":
+        return localize.ordinalNumber(quarter, { unit: "quarter" });
+      // Q1, Q2, Q3, Q4
+      case "QQQ":
+        return localize.quarter(quarter, {
+          width: "abbreviated",
+          context: "formatting",
+        });
+      // 1, 2, 3, 4 (narrow quarter; could be not numerical)
+      case "QQQQQ":
+        return localize.quarter(quarter, {
+          width: "narrow",
+          context: "formatting",
+        });
+      // 1st quarter, 2nd quarter, ...
+      case "QQQQ":
+      default:
+        return localize.quarter(quarter, {
+          width: "wide",
+          context: "formatting",
+        });
+    }
+  },
+
+  // Stand-alone quarter
+  q: function (date, token, localize) {
+    const quarter = Math.ceil((date.getMonth() + 1) / 3);
+    switch (token) {
+      // 1, 2, 3, 4
+      case "q":
+        return String(quarter);
+      // 01, 02, 03, 04
+      case "qq":
+        return addLeadingZeros(quarter, 2);
+      // 1st, 2nd, 3rd, 4th
+      case "qo":
+        return localize.ordinalNumber(quarter, { unit: "quarter" });
+      // Q1, Q2, Q3, Q4
+      case "qqq":
+        return localize.quarter(quarter, {
+          width: "abbreviated",
+          context: "standalone",
+        });
+      // 1, 2, 3, 4 (narrow quarter; could be not numerical)
+      case "qqqqq":
+        return localize.quarter(quarter, {
+          width: "narrow",
+          context: "standalone",
+        });
+      // 1st quarter, 2nd quarter, ...
+      case "qqqq":
+      default:
+        return localize.quarter(quarter, {
+          width: "wide",
+          context: "standalone",
+        });
+    }
+  },
+
+  // Month
+  M: function (date, token, localize) {
+    const month = date.getMonth();
+    switch (token) {
+      case "M":
+      case "MM":
+        return lightFormatters.M(date, token);
+      // 1st, 2nd, ..., 12th
+      case "Mo":
+        return localize.ordinalNumber(month + 1, { unit: "month" });
+      // Jan, Feb, ..., Dec
+      case "MMM":
+        return localize.month(month, {
+          width: "abbreviated",
+          context: "formatting",
+        });
+      // J, F, ..., D
+      case "MMMMM":
+        return localize.month(month, {
+          width: "narrow",
+          context: "formatting",
+        });
+      // January, February, ..., December
+      case "MMMM":
+      default:
+        return localize.month(month, { width: "wide", context: "formatting" });
+    }
+  },
+
+  // Stand-alone month
+  L: function (date, token, localize) {
+    const month = date.getMonth();
+    switch (token) {
+      // 1, 2, ..., 12
+      case "L":
+        return String(month + 1);
+      // 01, 02, ..., 12
+      case "LL":
+        return addLeadingZeros(month + 1, 2);
+      // 1st, 2nd, ..., 12th
+      case "Lo":
+        return localize.ordinalNumber(month + 1, { unit: "month" });
+      // Jan, Feb, ..., Dec
+      case "LLL":
+        return localize.month(month, {
+          width: "abbreviated",
+          context: "standalone",
+        });
+      // J, F, ..., D
+      case "LLLLL":
+        return localize.month(month, {
+          width: "narrow",
+          context: "standalone",
+        });
+      // January, February, ..., December
+      case "LLLL":
+      default:
+        return localize.month(month, { width: "wide", context: "standalone" });
+    }
+  },
+
+  // Local week of year
+  w: function (date, token, localize, options) {
+    const week = getWeek(date, options);
+
+    if (token === "wo") {
+      return localize.ordinalNumber(week, { unit: "week" });
+    }
+
+    return addLeadingZeros(week, token.length);
+  },
+
+  // ISO week of year
+  I: function (date, token, localize) {
+    const isoWeek = getISOWeek(date);
+
+    if (token === "Io") {
+      return localize.ordinalNumber(isoWeek, { unit: "week" });
+    }
+
+    return addLeadingZeros(isoWeek, token.length);
+  },
+
+  // Day of the month
+  d: function (date, token, localize) {
+    if (token === "do") {
+      return localize.ordinalNumber(date.getDate(), { unit: "date" });
+    }
+
+    return lightFormatters.d(date, token);
+  },
+
+  // Day of year
+  D: function (date, token, localize) {
+    const dayOfYear = getDayOfYear(date);
+
+    if (token === "Do") {
+      return localize.ordinalNumber(dayOfYear, { unit: "dayOfYear" });
+    }
+
+    return addLeadingZeros(dayOfYear, token.length);
+  },
+
+  // Day of week
+  E: function (date, token, localize) {
+    const dayOfWeek = date.getDay();
+    switch (token) {
+      // Tue
+      case "E":
+      case "EE":
+      case "EEE":
+        return localize.day(dayOfWeek, {
+          width: "abbreviated",
+          context: "formatting",
+        });
+      // T
+      case "EEEEE":
+        return localize.day(dayOfWeek, {
+          width: "narrow",
+          context: "formatting",
+        });
+      // Tu
+      case "EEEEEE":
+        return localize.day(dayOfWeek, {
+          width: "short",
+          context: "formatting",
+        });
+      // Tuesday
+      case "EEEE":
+      default:
+        return localize.day(dayOfWeek, {
+          width: "wide",
+          context: "formatting",
+        });
+    }
+  },
+
+  // Local day of week
+  e: function (date, token, localize, options) {
+    const dayOfWeek = date.getDay();
+    const localDayOfWeek = (dayOfWeek - options.weekStartsOn + 8) % 7 || 7;
+    switch (token) {
+      // Numerical value (Nth day of week with current locale or weekStartsOn)
+      case "e":
+        return String(localDayOfWeek);
+      // Padded numerical value
+      case "ee":
+        return addLeadingZeros(localDayOfWeek, 2);
+      // 1st, 2nd, ..., 7th
+      case "eo":
+        return localize.ordinalNumber(localDayOfWeek, { unit: "day" });
+      case "eee":
+        return localize.day(dayOfWeek, {
+          width: "abbreviated",
+          context: "formatting",
+        });
+      // T
+      case "eeeee":
+        return localize.day(dayOfWeek, {
+          width: "narrow",
+          context: "formatting",
+        });
+      // Tu
+      case "eeeeee":
+        return localize.day(dayOfWeek, {
+          width: "short",
+          context: "formatting",
+        });
+      // Tuesday
+      case "eeee":
+      default:
+        return localize.day(dayOfWeek, {
+          width: "wide",
+          context: "formatting",
+        });
+    }
+  },
+
+  // Stand-alone local day of week
+  c: function (date, token, localize, options) {
+    const dayOfWeek = date.getDay();
+    const localDayOfWeek = (dayOfWeek - options.weekStartsOn + 8) % 7 || 7;
+    switch (token) {
+      // Numerical value (same as in `e`)
+      case "c":
+        return String(localDayOfWeek);
+      // Padded numerical value
+      case "cc":
+        return addLeadingZeros(localDayOfWeek, token.length);
+      // 1st, 2nd, ..., 7th
+      case "co":
+        return localize.ordinalNumber(localDayOfWeek, { unit: "day" });
+      case "ccc":
+        return localize.day(dayOfWeek, {
+          width: "abbreviated",
+          context: "standalone",
+        });
+      // T
+      case "ccccc":
+        return localize.day(dayOfWeek, {
+          width: "narrow",
+          context: "standalone",
+        });
+      // Tu
+      case "cccccc":
+        return localize.day(dayOfWeek, {
+          width: "short",
+          context: "standalone",
+        });
+      // Tuesday
+      case "cccc":
+      default:
+        return localize.day(dayOfWeek, {
+          width: "wide",
+          context: "standalone",
+        });
+    }
+  },
+
+  // ISO day of week
+  i: function (date, token, localize) {
+    const dayOfWeek = date.getDay();
+    const isoDayOfWeek = dayOfWeek === 0 ? 7 : dayOfWeek;
+    switch (token) {
+      // 2
+      case "i":
+        return String(isoDayOfWeek);
+      // 02
+      case "ii":
+        return addLeadingZeros(isoDayOfWeek, token.length);
+      // 2nd
+      case "io":
+        return localize.ordinalNumber(isoDayOfWeek, { unit: "day" });
+      // Tue
+      case "iii":
+        return localize.day(dayOfWeek, {
+          width: "abbreviated",
+          context: "formatting",
+        });
+      // T
+      case "iiiii":
+        return localize.day(dayOfWeek, {
+          width: "narrow",
+          context: "formatting",
+        });
+      // Tu
+      case "iiiiii":
+        return localize.day(dayOfWeek, {
+          width: "short",
+          context: "formatting",
+        });
+      // Tuesday
+      case "iiii":
+      default:
+        return localize.day(dayOfWeek, {
+          width: "wide",
+          context: "formatting",
+        });
+    }
+  },
+
+  // AM or PM
+  a: function (date, token, localize) {
+    const hours = date.getHours();
+    const dayPeriodEnumValue = hours / 12 >= 1 ? "pm" : "am";
+
+    switch (token) {
+      case "a":
+      case "aa":
+        return localize.dayPeriod(dayPeriodEnumValue, {
+          width: "abbreviated",
+          context: "formatting",
+        });
+      case "aaa":
+        return localize
+          .dayPeriod(dayPeriodEnumValue, {
+            width: "abbreviated",
+            context: "formatting",
+          })
+          .toLowerCase();
+      case "aaaaa":
+        return localize.dayPeriod(dayPeriodEnumValue, {
+          width: "narrow",
+          context: "formatting",
+        });
+      case "aaaa":
+      default:
+        return localize.dayPeriod(dayPeriodEnumValue, {
+          width: "wide",
+          context: "formatting",
+        });
+    }
+  },
+
+  // AM, PM, midnight, noon
+  b: function (date, token, localize) {
+    const hours = date.getHours();
+    let dayPeriodEnumValue;
+    if (hours === 12) {
+      dayPeriodEnumValue = dayPeriodEnum.noon;
+    } else if (hours === 0) {
+      dayPeriodEnumValue = dayPeriodEnum.midnight;
+    } else {
+      dayPeriodEnumValue = hours / 12 >= 1 ? "pm" : "am";
+    }
+
+    switch (token) {
+      case "b":
+      case "bb":
+        return localize.dayPeriod(dayPeriodEnumValue, {
+          width: "abbreviated",
+          context: "formatting",
+        });
+      case "bbb":
+        return localize
+          .dayPeriod(dayPeriodEnumValue, {
+            width: "abbreviated",
+            context: "formatting",
+          })
+          .toLowerCase();
+      case "bbbbb":
+        return localize.dayPeriod(dayPeriodEnumValue, {
+          width: "narrow",
+          context: "formatting",
+        });
+      case "bbbb":
+      default:
+        return localize.dayPeriod(dayPeriodEnumValue, {
+          width: "wide",
+          context: "formatting",
+        });
+    }
+  },
+
+  // in the morning, in the afternoon, in the evening, at night
+  B: function (date, token, localize) {
+    const hours = date.getHours();
+    let dayPeriodEnumValue;
+    if (hours >= 17) {
+      dayPeriodEnumValue = dayPeriodEnum.evening;
+    } else if (hours >= 12) {
+      dayPeriodEnumValue = dayPeriodEnum.afternoon;
+    } else if (hours >= 4) {
+      dayPeriodEnumValue = dayPeriodEnum.morning;
+    } else {
+      dayPeriodEnumValue = dayPeriodEnum.night;
+    }
+
+    switch (token) {
+      case "B":
+      case "BB":
+      case "BBB":
+        return localize.dayPeriod(dayPeriodEnumValue, {
+          width: "abbreviated",
+          context: "formatting",
+        });
+      case "BBBBB":
+        return localize.dayPeriod(dayPeriodEnumValue, {
+          width: "narrow",
+          context: "formatting",
+        });
+      case "BBBB":
+      default:
+        return localize.dayPeriod(dayPeriodEnumValue, {
+          width: "wide",
+          context: "formatting",
+        });
+    }
+  },
+
+  // Hour [1-12]
+  h: function (date, token, localize) {
+    if (token === "ho") {
+      let hours = date.getHours() % 12;
+      if (hours === 0) hours = 12;
+      return localize.ordinalNumber(hours, { unit: "hour" });
+    }
+
+    return lightFormatters.h(date, token);
+  },
+
+  // Hour [0-23]
+  H: function (date, token, localize) {
+    if (token === "Ho") {
+      return localize.ordinalNumber(date.getHours(), { unit: "hour" });
+    }
+
+    return lightFormatters.H(date, token);
+  },
+
+  // Hour [0-11]
+  K: function (date, token, localize) {
+    const hours = date.getHours() % 12;
+
+    if (token === "Ko") {
+      return localize.ordinalNumber(hours, { unit: "hour" });
+    }
+
+    return addLeadingZeros(hours, token.length);
+  },
+
+  // Hour [1-24]
+  k: function (date, token, localize) {
+    let hours = date.getHours();
+    if (hours === 0) hours = 24;
+
+    if (token === "ko") {
+      return localize.ordinalNumber(hours, { unit: "hour" });
+    }
+
+    return addLeadingZeros(hours, token.length);
+  },
+
+  // Minute
+  m: function (date, token, localize) {
+    if (token === "mo") {
+      return localize.ordinalNumber(date.getMinutes(), { unit: "minute" });
+    }
+
+    return lightFormatters.m(date, token);
+  },
+
+  // Second
+  s: function (date, token, localize) {
+    if (token === "so") {
+      return localize.ordinalNumber(date.getSeconds(), { unit: "second" });
+    }
+
+    return lightFormatters.s(date, token);
+  },
+
+  // Fraction of second
+  S: function (date, token) {
+    return lightFormatters.S(date, token);
+  },
+
+  // Timezone (ISO-8601. If offset is 0, output is always `'Z'`)
+  X: function (date, token, _localize) {
+    const timezoneOffset = date.getTimezoneOffset();
+
+    if (timezoneOffset === 0) {
+      return "Z";
+    }
+
+    switch (token) {
+      // Hours and optional minutes
+      case "X":
+        return formatTimezoneWithOptionalMinutes(timezoneOffset);
+
+      // Hours, minutes and optional seconds without `:` delimiter
+      // Note: neither ISO-8601 nor JavaScript supports seconds in timezone offsets
+      // so this token always has the same output as `XX`
+      case "XXXX":
+      case "XX": // Hours and minutes without `:` delimiter
+        return formatTimezone(timezoneOffset);
+
+      // Hours, minutes and optional seconds with `:` delimiter
+      // Note: neither ISO-8601 nor JavaScript supports seconds in timezone offsets
+      // so this token always has the same output as `XXX`
+      case "XXXXX":
+      case "XXX": // Hours and minutes with `:` delimiter
+      default:
+        return formatTimezone(timezoneOffset, ":");
+    }
+  },
+
+  // Timezone (ISO-8601. If offset is 0, output is `'+00:00'` or equivalent)
+  x: function (date, token, _localize) {
+    const timezoneOffset = date.getTimezoneOffset();
+
+    switch (token) {
+      // Hours and optional minutes
+      case "x":
+        return formatTimezoneWithOptionalMinutes(timezoneOffset);
+
+      // Hours, minutes and optional seconds without `:` delimiter
+      // Note: neither ISO-8601 nor JavaScript supports seconds in timezone offsets
+      // so this token always has the same output as `xx`
+      case "xxxx":
+      case "xx": // Hours and minutes without `:` delimiter
+        return formatTimezone(timezoneOffset);
+
+      // Hours, minutes and optional seconds with `:` delimiter
+      // Note: neither ISO-8601 nor JavaScript supports seconds in timezone offsets
+      // so this token always has the same output as `xxx`
+      case "xxxxx":
+      case "xxx": // Hours and minutes with `:` delimiter
+      default:
+        return formatTimezone(timezoneOffset, ":");
+    }
+  },
+
+  // Timezone (GMT)
+  O: function (date, token, _localize) {
+    const timezoneOffset = date.getTimezoneOffset();
+
+    switch (token) {
+      // Short
+      case "O":
+      case "OO":
+      case "OOO":
+        return "GMT" + formatTimezoneShort(timezoneOffset, ":");
+      // Long
+      case "OOOO":
+      default:
+        return "GMT" + formatTimezone(timezoneOffset, ":");
+    }
+  },
+
+  // Timezone (specific non-location)
+  z: function (date, token, _localize) {
+    const timezoneOffset = date.getTimezoneOffset();
+
+    switch (token) {
+      // Short
+      case "z":
+      case "zz":
+      case "zzz":
+        return "GMT" + formatTimezoneShort(timezoneOffset, ":");
+      // Long
+      case "zzzz":
+      default:
+        return "GMT" + formatTimezone(timezoneOffset, ":");
+    }
+  },
+
+  // Seconds timestamp
+  t: function (date, token, _localize) {
+    const timestamp = Math.trunc(+date / 1000);
+    return addLeadingZeros(timestamp, token.length);
+  },
+
+  // Milliseconds timestamp
+  T: function (date, token, _localize) {
+    return addLeadingZeros(+date, token.length);
+  },
+};
+
+function formatTimezoneShort(offset, delimiter = "") {
+  const sign = offset > 0 ? "-" : "+";
+  const absOffset = Math.abs(offset);
+  const hours = Math.trunc(absOffset / 60);
+  const minutes = absOffset % 60;
+  if (minutes === 0) {
+    return sign + String(hours);
+  }
+  return sign + String(hours) + delimiter + addLeadingZeros(minutes, 2);
+}
+
+function formatTimezoneWithOptionalMinutes(offset, delimiter) {
+  if (offset % 60 === 0) {
+    const sign = offset > 0 ? "-" : "+";
+    return sign + addLeadingZeros(Math.abs(offset) / 60, 2);
+  }
+  return formatTimezone(offset, delimiter);
+}
+
+function formatTimezone(offset, delimiter = "") {
+  const sign = offset > 0 ? "-" : "+";
+  const absOffset = Math.abs(offset);
+  const hours = addLeadingZeros(Math.trunc(absOffset / 60), 2);
+  const minutes = addLeadingZeros(absOffset % 60, 2);
+  return sign + hours + delimiter + minutes;
+}
+
+const dateLongFormatter = (pattern, formatLong) => {
+  switch (pattern) {
+    case "P":
+      return formatLong.date({ width: "short" });
+    case "PP":
+      return formatLong.date({ width: "medium" });
+    case "PPP":
+      return formatLong.date({ width: "long" });
+    case "PPPP":
+    default:
+      return formatLong.date({ width: "full" });
+  }
+};
+
+const timeLongFormatter = (pattern, formatLong) => {
+  switch (pattern) {
+    case "p":
+      return formatLong.time({ width: "short" });
+    case "pp":
+      return formatLong.time({ width: "medium" });
+    case "ppp":
+      return formatLong.time({ width: "long" });
+    case "pppp":
+    default:
+      return formatLong.time({ width: "full" });
+  }
+};
+
+const dateTimeLongFormatter = (pattern, formatLong) => {
+  const matchResult = pattern.match(/(P+)(p+)?/) || [];
+  const datePattern = matchResult[1];
+  const timePattern = matchResult[2];
+
+  if (!timePattern) {
+    return dateLongFormatter(pattern, formatLong);
+  }
+
+  let dateTimeFormat;
+
+  switch (datePattern) {
+    case "P":
+      dateTimeFormat = formatLong.dateTime({ width: "short" });
+      break;
+    case "PP":
+      dateTimeFormat = formatLong.dateTime({ width: "medium" });
+      break;
+    case "PPP":
+      dateTimeFormat = formatLong.dateTime({ width: "long" });
+      break;
+    case "PPPP":
+    default:
+      dateTimeFormat = formatLong.dateTime({ width: "full" });
+      break;
+  }
+
+  return dateTimeFormat
+    .replace("{{date}}", dateLongFormatter(datePattern, formatLong))
+    .replace("{{time}}", timeLongFormatter(timePattern, formatLong));
+};
+
+const longFormatters = {
+  p: timeLongFormatter,
+  P: dateTimeLongFormatter,
+};
+
+const dayOfYearTokenRE = /^D+$/;
+const weekYearTokenRE = /^Y+$/;
+
+const throwTokens = ["D", "DD", "YY", "YYYY"];
+
+function isProtectedDayOfYearToken(token) {
+  return dayOfYearTokenRE.test(token);
+}
+
+function isProtectedWeekYearToken(token) {
+  return weekYearTokenRE.test(token);
+}
+
+function warnOrThrowProtectedError(token, format, input) {
+  const _message = message(token, format, input);
+  console.warn(_message);
+  if (throwTokens.includes(token)) throw new RangeError(_message);
+}
+
+function message(token, format, input) {
+  const subject = token[0] === "Y" ? "years" : "days of the month";
+  return `Use \`${token.toLowerCase()}\` instead of \`${token}\` (in \`${format}\`) for formatting ${subject} to the input \`${input}\`; see: https://github.com/date-fns/date-fns/blob/master/docs/unicodeTokens.md`;
+}
+
+// This RegExp consists of three parts separated by `|`:
+// - [yYQqMLwIdDecihHKkms]o matches any available ordinal number token
+//   (one of the certain letters followed by `o`)
+// - (\w)\1* matches any sequences of the same letter
+// - '' matches two quote characters in a row
+// - '(''|[^'])+('|$) matches anything surrounded by two quote characters ('),
+//   except a single quote symbol, which ends the sequence.
+//   Two quote characters do not end the sequence.
+//   If there is no matching single quote
+//   then the sequence will continue until the end of the string.
+// - . matches any single character unmatched by previous parts of the RegExps
+const formattingTokensRegExp =
+  /[yYQqMLwIdDecihHKkms]o|(\w)\1*|''|'(''|[^'])+('|$)|./g;
+
+// This RegExp catches symbols escaped by quotes, and also
+// sequences of symbols P, p, and the combinations like `PPPPPPPppppp`
+const longFormattingTokensRegExp = /P+p+|P+|p+|''|'(''|[^'])+('|$)|./g;
+
+const escapedStringRegExp = /^'([^]*?)'?$/;
+const doubleQuoteRegExp = /''/g;
+const unescapedLatinCharacterRegExp = /[a-zA-Z]/;
+
+/**
+ * The {@link format} function options.
+ */
+
+/**
+ * @name format
+ * @alias formatDate
+ * @category Common Helpers
+ * @summary Format the date.
+ *
+ * @description
+ * Return the formatted date string in the given format. The result may vary by locale.
+ *
+ * > ⚠️ Please note that the `format` tokens differ from Moment.js and other libraries.
+ * > See: https://github.com/date-fns/date-fns/blob/master/docs/unicodeTokens.md
+ *
+ * The characters wrapped between two single quotes characters (') are escaped.
+ * Two single quotes in a row, whether inside or outside a quoted sequence, represent a 'real' single quote.
+ * (see the last example)
+ *
+ * Format of the string is based on Unicode Technical Standard #35:
+ * https://www.unicode.org/reports/tr35/tr35-dates.html#Date_Field_Symbol_Table
+ * with a few additions (see note 7 below the table).
+ *
+ * Accepted patterns:
+ * | Unit                            | Pattern | Result examples                   | Notes |
+ * |---------------------------------|---------|-----------------------------------|-------|
+ * | Era                             | G..GGG  | AD, BC                            |       |
+ * |                                 | GGGG    | Anno Domini, Before Christ        | 2     |
+ * |                                 | GGGGG   | A, B                              |       |
+ * | Calendar year                   | y       | 44, 1, 1900, 2017                 | 5     |
+ * |                                 | yo      | 44th, 1st, 0th, 17th              | 5,7   |
+ * |                                 | yy      | 44, 01, 00, 17                    | 5     |
+ * |                                 | yyy     | 044, 001, 1900, 2017              | 5     |
+ * |                                 | yyyy    | 0044, 0001, 1900, 2017            | 5     |
+ * |                                 | yyyyy   | ...                               | 3,5   |
+ * | Local week-numbering year       | Y       | 44, 1, 1900, 2017                 | 5     |
+ * |                                 | Yo      | 44th, 1st, 1900th, 2017th         | 5,7   |
+ * |                                 | YY      | 44, 01, 00, 17                    | 5,8   |
+ * |                                 | YYY     | 044, 001, 1900, 2017              | 5     |
+ * |                                 | YYYY    | 0044, 0001, 1900, 2017            | 5,8   |
+ * |                                 | YYYYY   | ...                               | 3,5   |
+ * | ISO week-numbering year         | R       | -43, 0, 1, 1900, 2017             | 5,7   |
+ * |                                 | RR      | -43, 00, 01, 1900, 2017           | 5,7   |
+ * |                                 | RRR     | -043, 000, 001, 1900, 2017        | 5,7   |
+ * |                                 | RRRR    | -0043, 0000, 0001, 1900, 2017     | 5,7   |
+ * |                                 | RRRRR   | ...                               | 3,5,7 |
+ * | Extended year                   | u       | -43, 0, 1, 1900, 2017             | 5     |
+ * |                                 | uu      | -43, 01, 1900, 2017               | 5     |
+ * |                                 | uuu     | -043, 001, 1900, 2017             | 5     |
+ * |                                 | uuuu    | -0043, 0001, 1900, 2017           | 5     |
+ * |                                 | uuuuu   | ...                               | 3,5   |
+ * | Quarter (formatting)            | Q       | 1, 2, 3, 4                        |       |
+ * |                                 | Qo      | 1st, 2nd, 3rd, 4th                | 7     |
+ * |                                 | QQ      | 01, 02, 03, 04                    |       |
+ * |                                 | QQQ     | Q1, Q2, Q3, Q4                    |       |
+ * |                                 | QQQQ    | 1st quarter, 2nd quarter, ...     | 2     |
+ * |                                 | QQQQQ   | 1, 2, 3, 4                        | 4     |
+ * | Quarter (stand-alone)           | q       | 1, 2, 3, 4                        |       |
+ * |                                 | qo      | 1st, 2nd, 3rd, 4th                | 7     |
+ * |                                 | qq      | 01, 02, 03, 04                    |       |
+ * |                                 | qqq     | Q1, Q2, Q3, Q4                    |       |
+ * |                                 | qqqq    | 1st quarter, 2nd quarter, ...     | 2     |
+ * |                                 | qqqqq   | 1, 2, 3, 4                        | 4     |
+ * | Month (formatting)              | M       | 1, 2, ..., 12                     |       |
+ * |                                 | Mo      | 1st, 2nd, ..., 12th               | 7     |
+ * |                                 | MM      | 01, 02, ..., 12                   |       |
+ * |                                 | MMM     | Jan, Feb, ..., Dec                |       |
+ * |                                 | MMMM    | January, February, ..., December  | 2     |
+ * |                                 | MMMMM   | J, F, ..., D                      |       |
+ * | Month (stand-alone)             | L       | 1, 2, ..., 12                     |       |
+ * |                                 | Lo      | 1st, 2nd, ..., 12th               | 7     |
+ * |                                 | LL      | 01, 02, ..., 12                   |       |
+ * |                                 | LLL     | Jan, Feb, ..., Dec                |       |
+ * |                                 | LLLL    | January, February, ..., December  | 2     |
+ * |                                 | LLLLL   | J, F, ..., D                      |       |
+ * | Local week of year              | w       | 1, 2, ..., 53                     |       |
+ * |                                 | wo      | 1st, 2nd, ..., 53th               | 7     |
+ * |                                 | ww      | 01, 02, ..., 53                   |       |
+ * | ISO week of year                | I       | 1, 2, ..., 53                     | 7     |
+ * |                                 | Io      | 1st, 2nd, ..., 53th               | 7     |
+ * |                                 | II      | 01, 02, ..., 53                   | 7     |
+ * | Day of month                    | d       | 1, 2, ..., 31                     |       |
+ * |                                 | do      | 1st, 2nd, ..., 31st               | 7     |
+ * |                                 | dd      | 01, 02, ..., 31                   |       |
+ * | Day of year                     | D       | 1, 2, ..., 365, 366               | 9     |
+ * |                                 | Do      | 1st, 2nd, ..., 365th, 366th       | 7     |
+ * |                                 | DD      | 01, 02, ..., 365, 366             | 9     |
+ * |                                 | DDD     | 001, 002, ..., 365, 366           |       |
+ * |                                 | DDDD    | ...                               | 3     |
+ * | Day of week (formatting)        | E..EEE  | Mon, Tue, Wed, ..., Sun           |       |
+ * |                                 | EEEE    | Monday, Tuesday, ..., Sunday      | 2     |
+ * |                                 | EEEEE   | M, T, W, T, F, S, S               |       |
+ * |                                 | EEEEEE  | Mo, Tu, We, Th, Fr, Sa, Su        |       |
+ * | ISO day of week (formatting)    | i       | 1, 2, 3, ..., 7                   | 7     |
+ * |                                 | io      | 1st, 2nd, ..., 7th                | 7     |
+ * |                                 | ii      | 01, 02, ..., 07                   | 7     |
+ * |                                 | iii     | Mon, Tue, Wed, ..., Sun           | 7     |
+ * |                                 | iiii    | Monday, Tuesday, ..., Sunday      | 2,7   |
+ * |                                 | iiiii   | M, T, W, T, F, S, S               | 7     |
+ * |                                 | iiiiii  | Mo, Tu, We, Th, Fr, Sa, Su        | 7     |
+ * | Local day of week (formatting)  | e       | 2, 3, 4, ..., 1                   |       |
+ * |                                 | eo      | 2nd, 3rd, ..., 1st                | 7     |
+ * |                                 | ee      | 02, 03, ..., 01                   |       |
+ * |                                 | eee     | Mon, Tue, Wed, ..., Sun           |       |
+ * |                                 | eeee    | Monday, Tuesday, ..., Sunday      | 2     |
+ * |                                 | eeeee   | M, T, W, T, F, S, S               |       |
+ * |                                 | eeeeee  | Mo, Tu, We, Th, Fr, Sa, Su        |       |
+ * | Local day of week (stand-alone) | c       | 2, 3, 4, ..., 1                   |       |
+ * |                                 | co      | 2nd, 3rd, ..., 1st                | 7     |
+ * |                                 | cc      | 02, 03, ..., 01                   |       |
+ * |                                 | ccc     | Mon, Tue, Wed, ..., Sun           |       |
+ * |                                 | cccc    | Monday, Tuesday, ..., Sunday      | 2     |
+ * |                                 | ccccc   | M, T, W, T, F, S, S               |       |
+ * |                                 | cccccc  | Mo, Tu, We, Th, Fr, Sa, Su        |       |
+ * | AM, PM                          | a..aa   | AM, PM                            |       |
+ * |                                 | aaa     | am, pm                            |       |
+ * |                                 | aaaa    | a.m., p.m.                        | 2     |
+ * |                                 | aaaaa   | a, p                              |       |
+ * | AM, PM, noon, midnight          | b..bb   | AM, PM, noon, midnight            |       |
+ * |                                 | bbb     | am, pm, noon, midnight            |       |
+ * |                                 | bbbb    | a.m., p.m., noon, midnight        | 2     |
+ * |                                 | bbbbb   | a, p, n, mi                       |       |
+ * | Flexible day period             | B..BBB  | at night, in the morning, ...     |       |
+ * |                                 | BBBB    | at night, in the morning, ...     | 2     |
+ * |                                 | BBBBB   | at night, in the morning, ...     |       |
+ * | Hour [1-12]                     | h       | 1, 2, ..., 11, 12                 |       |
+ * |                                 | ho      | 1st, 2nd, ..., 11th, 12th         | 7     |
+ * |                                 | hh      | 01, 02, ..., 11, 12               |       |
+ * | Hour [0-23]                     | H       | 0, 1, 2, ..., 23                  |       |
+ * |                                 | Ho      | 0th, 1st, 2nd, ..., 23rd          | 7     |
+ * |                                 | HH      | 00, 01, 02, ..., 23               |       |
+ * | Hour [0-11]                     | K       | 1, 2, ..., 11, 0                  |       |
+ * |                                 | Ko      | 1st, 2nd, ..., 11th, 0th          | 7     |
+ * |                                 | KK      | 01, 02, ..., 11, 00               |       |
+ * | Hour [1-24]                     | k       | 24, 1, 2, ..., 23                 |       |
+ * |                                 | ko      | 24th, 1st, 2nd, ..., 23rd         | 7     |
+ * |                                 | kk      | 24, 01, 02, ..., 23               |       |
+ * | Minute                          | m       | 0, 1, ..., 59                     |       |
+ * |                                 | mo      | 0th, 1st, ..., 59th               | 7     |
+ * |                                 | mm      | 00, 01, ..., 59                   |       |
+ * | Second                          | s       | 0, 1, ..., 59                     |       |
+ * |                                 | so      | 0th, 1st, ..., 59th               | 7     |
+ * |                                 | ss      | 00, 01, ..., 59                   |       |
+ * | Fraction of second              | S       | 0, 1, ..., 9                      |       |
+ * |                                 | SS      | 00, 01, ..., 99                   |       |
+ * |                                 | SSS     | 000, 001, ..., 999                |       |
+ * |                                 | SSSS    | ...                               | 3     |
+ * | Timezone (ISO-8601 w/ Z)        | X       | -08, +0530, Z                     |       |
+ * |                                 | XX      | -0800, +0530, Z                   |       |
+ * |                                 | XXX     | -08:00, +05:30, Z                 |       |
+ * |                                 | XXXX    | -0800, +0530, Z, +123456          | 2     |
+ * |                                 | XXXXX   | -08:00, +05:30, Z, +12:34:56      |       |
+ * | Timezone (ISO-8601 w/o Z)       | x       | -08, +0530, +00                   |       |
+ * |                                 | xx      | -0800, +0530, +0000               |       |
+ * |                                 | xxx     | -08:00, +05:30, +00:00            | 2     |
+ * |                                 | xxxx    | -0800, +0530, +0000, +123456      |       |
+ * |                                 | xxxxx   | -08:00, +05:30, +00:00, +12:34:56 |       |
+ * | Timezone (GMT)                  | O...OOO | GMT-8, GMT+5:30, GMT+0            |       |
+ * |                                 | OOOO    | GMT-08:00, GMT+05:30, GMT+00:00   | 2     |
+ * | Timezone (specific non-locat.)  | z...zzz | GMT-8, GMT+5:30, GMT+0            | 6     |
+ * |                                 | zzzz    | GMT-08:00, GMT+05:30, GMT+00:00   | 2,6   |
+ * | Seconds timestamp               | t       | 512969520                         | 7     |
+ * |                                 | tt      | ...                               | 3,7   |
+ * | Milliseconds timestamp          | T       | 512969520900                      | 7     |
+ * |                                 | TT      | ...                               | 3,7   |
+ * | Long localized date             | P       | 04/29/1453                        | 7     |
+ * |                                 | PP      | Apr 29, 1453                      | 7     |
+ * |                                 | PPP     | April 29th, 1453                  | 7     |
+ * |                                 | PPPP    | Friday, April 29th, 1453          | 2,7   |
+ * | Long localized time             | p       | 12:00 AM                          | 7     |
+ * |                                 | pp      | 12:00:00 AM                       | 7     |
+ * |                                 | ppp     | 12:00:00 AM GMT+2                 | 7     |
+ * |                                 | pppp    | 12:00:00 AM GMT+02:00             | 2,7   |
+ * | Combination of date and time    | Pp      | 04/29/1453, 12:00 AM              | 7     |
+ * |                                 | PPpp    | Apr 29, 1453, 12:00:00 AM         | 7     |
+ * |                                 | PPPppp  | April 29th, 1453 at ...           | 7     |
+ * |                                 | PPPPpppp| Friday, April 29th, 1453 at ...   | 2,7   |
+ * Notes:
+ * 1. "Formatting" units (e.g. formatting quarter) in the default en-US locale
+ *    are the same as "stand-alone" units, but are different in some languages.
+ *    "Formatting" units are declined according to the rules of the language
+ *    in the context of a date. "Stand-alone" units are always nominative singular:
+ *
+ *    `format(new Date(2017, 10, 6), 'do LLLL', {locale: cs}) //=> '6. listopad'`
+ *
+ *    `format(new Date(2017, 10, 6), 'do MMMM', {locale: cs}) //=> '6. listopadu'`
+ *
+ * 2. Any sequence of the identical letters is a pattern, unless it is escaped by
+ *    the single quote characters (see below).
+ *    If the sequence is longer than listed in table (e.g. `EEEEEEEEEEE`)
+ *    the output will be the same as default pattern for this unit, usually
+ *    the longest one (in case of ISO weekdays, `EEEE`). Default patterns for units
+ *    are marked with "2" in the last column of the table.
+ *
+ *    `format(new Date(2017, 10, 6), 'MMM') //=> 'Nov'`
+ *
+ *    `format(new Date(2017, 10, 6), 'MMMM') //=> 'November'`
+ *
+ *    `format(new Date(2017, 10, 6), 'MMMMM') //=> 'N'`
+ *
+ *    `format(new Date(2017, 10, 6), 'MMMMMM') //=> 'November'`
+ *
+ *    `format(new Date(2017, 10, 6), 'MMMMMMM') //=> 'November'`
+ *
+ * 3. Some patterns could be unlimited length (such as `yyyyyyyy`).
+ *    The output will be padded with zeros to match the length of the pattern.
+ *
+ *    `format(new Date(2017, 10, 6), 'yyyyyyyy') //=> '00002017'`
+ *
+ * 4. `QQQQQ` and `qqqqq` could be not strictly numerical in some locales.
+ *    These tokens represent the shortest form of the quarter.
+ *
+ * 5. The main difference between `y` and `u` patterns are B.C. years:
+ *
+ *    | Year | `y` | `u` |
+ *    |------|-----|-----|
+ *    | AC 1 |   1 |   1 |
+ *    | BC 1 |   1 |   0 |
+ *    | BC 2 |   2 |  -1 |
+ *
+ *    Also `yy` always returns the last two digits of a year,
+ *    while `uu` pads single digit years to 2 characters and returns other years unchanged:
+ *
+ *    | Year | `yy` | `uu` |
+ *    |------|------|------|
+ *    | 1    |   01 |   01 |
+ *    | 14   |   14 |   14 |
+ *    | 376  |   76 |  376 |
+ *    | 1453 |   53 | 1453 |
+ *
+ *    The same difference is true for local and ISO week-numbering years (`Y` and `R`),
+ *    except local week-numbering years are dependent on `options.weekStartsOn`
+ *    and `options.firstWeekContainsDate` (compare [getISOWeekYear](https://date-fns.org/docs/getISOWeekYear)
+ *    and [getWeekYear](https://date-fns.org/docs/getWeekYear)).
+ *
+ * 6. Specific non-location timezones are currently unavailable in `date-fns`,
+ *    so right now these tokens fall back to GMT timezones.
+ *
+ * 7. These patterns are not in the Unicode Technical Standard #35:
+ *    - `i`: ISO day of week
+ *    - `I`: ISO week of year
+ *    - `R`: ISO week-numbering year
+ *    - `t`: seconds timestamp
+ *    - `T`: milliseconds timestamp
+ *    - `o`: ordinal number modifier
+ *    - `P`: long localized date
+ *    - `p`: long localized time
+ *
+ * 8. `YY` and `YYYY` tokens represent week-numbering years but they are often confused with years.
+ *    You should enable `options.useAdditionalWeekYearTokens` to use them. See: https://github.com/date-fns/date-fns/blob/master/docs/unicodeTokens.md
+ *
+ * 9. `D` and `DD` tokens represent days of the year but they are often confused with days of the month.
+ *    You should enable `options.useAdditionalDayOfYearTokens` to use them. See: https://github.com/date-fns/date-fns/blob/master/docs/unicodeTokens.md
+ *
+ * @param date - The original date
+ * @param format - The string of tokens
+ * @param options - An object with options
+ *
+ * @returns The formatted date string
+ *
+ * @throws `date` must not be Invalid Date
+ * @throws `options.locale` must contain `localize` property
+ * @throws `options.locale` must contain `formatLong` property
+ * @throws use `yyyy` instead of `YYYY` for formatting years using [format provided] to the input [input provided]; see: https://github.com/date-fns/date-fns/blob/master/docs/unicodeTokens.md
+ * @throws use `yy` instead of `YY` for formatting years using [format provided] to the input [input provided]; see: https://github.com/date-fns/date-fns/blob/master/docs/unicodeTokens.md
+ * @throws use `d` instead of `D` for formatting days of the month using [format provided] to the input [input provided]; see: https://github.com/date-fns/date-fns/blob/master/docs/unicodeTokens.md
+ * @throws use `dd` instead of `DD` for formatting days of the month using [format provided] to the input [input provided]; see: https://github.com/date-fns/date-fns/blob/master/docs/unicodeTokens.md
+ * @throws format string contains an unescaped latin alphabet character
+ *
+ * @example
+ * // Represent 11 February 2014 in middle-endian format:
+ * const result = format(new Date(2014, 1, 11), 'MM/dd/yyyy')
+ * //=> '02/11/2014'
+ *
+ * @example
+ * // Represent 2 July 2014 in Esperanto:
+ * import { eoLocale } from 'date-fns/locale/eo'
+ * const result = format(new Date(2014, 6, 2), "do 'de' MMMM yyyy", {
+ *   locale: eoLocale
+ * })
+ * //=> '2-a de julio 2014'
+ *
+ * @example
+ * // Escape string by single quote characters:
+ * const result = format(new Date(2014, 6, 2, 15), "h 'o''clock'")
+ * //=> "3 o'clock"
+ */
+function format(date, formatStr, options) {
+  const defaultOptions = getDefaultOptions();
+  const locale = defaultOptions.locale ?? enUS;
+
+  const firstWeekContainsDate =
+    defaultOptions.firstWeekContainsDate ??
+    defaultOptions.locale?.options?.firstWeekContainsDate ??
+    1;
+
+  const weekStartsOn =
+    defaultOptions.weekStartsOn ??
+    defaultOptions.locale?.options?.weekStartsOn ??
+    0;
+
+  const originalDate = toDate(date, options?.in);
+
+  if (!isValid(originalDate)) {
+    throw new RangeError("Invalid time value");
+  }
+
+  let parts = formatStr
+    .match(longFormattingTokensRegExp)
+    .map((substring) => {
+      const firstCharacter = substring[0];
+      if (firstCharacter === "p" || firstCharacter === "P") {
+        const longFormatter = longFormatters[firstCharacter];
+        return longFormatter(substring, locale.formatLong);
+      }
+      return substring;
+    })
+    .join("")
+    .match(formattingTokensRegExp)
+    .map((substring) => {
+      // Replace two single quote characters with one single quote character
+      if (substring === "''") {
+        return { isToken: false, value: "'" };
+      }
+
+      const firstCharacter = substring[0];
+      if (firstCharacter === "'") {
+        return { isToken: false, value: cleanEscapedString(substring) };
+      }
+
+      if (formatters[firstCharacter]) {
+        return { isToken: true, value: substring };
+      }
+
+      if (firstCharacter.match(unescapedLatinCharacterRegExp)) {
+        throw new RangeError(
+          "Format string contains an unescaped latin alphabet character `" +
+            firstCharacter +
+            "`",
+        );
+      }
+
+      return { isToken: false, value: substring };
+    });
+
+  // invoke localize preprocessor (only for french locales at the moment)
+  if (locale.localize.preprocessor) {
+    parts = locale.localize.preprocessor(originalDate, parts);
+  }
+
+  const formatterOptions = {
+    firstWeekContainsDate,
+    weekStartsOn,
+    locale,
+  };
+
+  return parts
+    .map((part) => {
+      if (!part.isToken) return part.value;
+
+      const token = part.value;
+
+      if (
+        (isProtectedWeekYearToken(token)) ||
+        (isProtectedDayOfYearToken(token))
+      ) {
+        warnOrThrowProtectedError(token, formatStr, String(date));
+      }
+
+      const formatter = formatters[token[0]];
+      return formatter(originalDate, token, locale.localize, formatterOptions);
+    })
+    .join("");
+}
+
+function cleanEscapedString(input) {
+  const matched = input.match(escapedStringRegExp);
+
+  if (!matched) {
+    return input;
+  }
+
+  return matched[1].replace(doubleQuoteRegExp, "'");
+}
+
+const NOW_PATTERN = /%NOW(?::([^%]+))?%/g;
+function replaceTemplateVariables(message) {
+    if (!message)
+        return message;
+    const now = new Date();
+    return message.replace(NOW_PATTERN, (match, formatStr) => {
+        if (!formatStr) {
+            return now.toISOString();
+        }
+        try {
+            return format(now, formatStr);
+        }
+        catch {
+            warning(`Invalid date format in template: "${formatStr}", leaving as-is`);
+            return match;
+        }
+    });
+}
+
 async function manageComment(adapter, options) {
     let { message } = options;
-    const { allowRepeats, updateOnly, refreshMessagePosition, deleteOnStatus, status, messageId, messageFind, messageReplace, } = options;
+    const { allowRepeats, updateOnly, refreshMessagePosition, deleteOnStatus, status, messageId, messageFind, messageReplace, templateVariables, } = options;
     let existingComment;
     if (!allowRepeats) {
         debug('repeat comments are disallowed, checking for existing');
@@ -120574,10 +124178,16 @@ async function manageComment(adapter, options) {
         setOutput('comment-created', 'false');
         return;
     }
-    if (deleteOnStatus && existingComment && deleteOnStatus === status) {
-        info('deleting existing comment because delete-comment-on-status matched');
-        await adapter.delete(existingComment.id);
-        setOutput('comment-deleted', 'true');
+    if (deleteOnStatus && deleteOnStatus === status) {
+        if (existingComment) {
+            info('deleting existing comment because delete-comment-on-status matched');
+            await adapter.delete(existingComment.id);
+            setOutput('comment-deleted', 'true');
+        }
+        else {
+            info('skipping creating comment because delete-comment-on-status matched');
+            setOutput('comment-created', 'false');
+        }
         return;
     }
     if (messageFind?.length && (messageReplace?.length || message) && existingComment?.body) {
@@ -120585,6 +124195,9 @@ async function manageComment(adapter, options) {
     }
     if (!message) {
         throw new Error('no message, check your message inputs');
+    }
+    if (templateVariables) {
+        message = replaceTemplateVariables(message);
     }
     const body = addMessageHeader(messageId, message);
     let comment;
@@ -120612,7 +124225,7 @@ async function manageComment(adapter, options) {
 }
 const run = async () => {
     try {
-        const { allowRepeats, attachName, attachPath, attachText, commentTarget, messagePath, messageInput, messageId, refreshMessagePosition, repoToken, proxyUrl, issue, pullRequestNumber, commitSha, repo, owner, updateOnly, deleteOnStatus, messageCancelled, messageFailure, messageSuccess, messageSkipped, preformatted, status, messageFind, messageReplace, truncate, truncateSeparator, } = await getInputs();
+        const { allowRepeats, attachName, attachPath, attachText, commentTarget, messagePath, messageInput, messageId, refreshMessagePosition, repoToken, proxyUrl, issue, pullRequestNumber, commitSha, repo, owner, updateOnly, deleteOnStatus, messageCancelled, messageFailure, messageSuccess, messageSkipped, preformatted, templateVariables, status, messageFind, messageReplace, truncate, truncateSeparator, } = await getInputs();
         const octokit = getOctokit(repoToken);
         let message = await getMessage({
             messagePath,
@@ -120660,6 +124273,7 @@ const run = async () => {
             messageFind,
             messageReplace,
             message,
+            templateVariables,
         };
         if (commentTarget === 'commit') {
             await manageComment({
@@ -120704,6 +124318,9 @@ const run = async () => {
             }
             if (!msg) {
                 throw new Error('no message, check your message inputs');
+            }
+            if (templateVariables) {
+                msg = replaceTemplateVariables(msg);
             }
             const body = addMessageHeader(messageId, msg);
             const comment = await createCommentProxy({
